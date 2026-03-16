@@ -61,6 +61,15 @@ public:
                          ggml_tensor* cond,
                          ggml_tensor* dt);
 
+    void forward_cfg_pair(VoxCPMContext& ctx,
+                          ggml_tensor* x,
+                          ggml_tensor* mu,
+                          ggml_tensor* t_scalar,
+                          ggml_tensor* cond,
+                          ggml_tensor* dt_scalar,
+                          ggml_tensor** conditioned,
+                          ggml_tensor** unconditioned);
+
     const MiniCPMConfig& config() const { return decoder_.config(); }
     const LocDiTWeights& weights() const { return weights_; }
     int feat_dim() const { return feat_dim_; }

@@ -12,6 +12,7 @@
 
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace voxcpm {
@@ -42,6 +43,26 @@ struct VoxCPMDecodeResult {
     std::vector<float> output_0;  // [patch_size, feat_dim] in patch-major order
     VoxCPMDecodeState output_1;
     bool output_2 = false;
+};
+
+struct VoxCPMCachedGraph {
+    std::unique_ptr<VoxCPMContext> context;
+    ggml_cgraph* graph = nullptr;
+    ggml_tensor* input0 = nullptr;
+    ggml_tensor* input1 = nullptr;
+    ggml_tensor* input2 = nullptr;
+    ggml_tensor* input3 = nullptr;
+    ggml_tensor* output = nullptr;
+
+    void clear() {
+        context.reset();
+        graph = nullptr;
+        input0 = nullptr;
+        input1 = nullptr;
+        input2 = nullptr;
+        input3 = nullptr;
+        output = nullptr;
+    }
 };
 
 class VoxCPMRuntime {
@@ -126,7 +147,15 @@ private:
     bool update_config_from_gguf(const std::string& gguf_path);
     bool update_config_from_store(const VoxCPMWeightStore& store);
     void maybe_collect_graph(ggml_cgraph* graph);
+    void clear_cached_graphs();
+    VoxCPMCachedGraph& ensure_locenc_patch_graph();
+    VoxCPMCachedGraph& ensure_embedding_graph(int token_count);
+    VoxCPMCachedGraph& ensure_enc_to_lm_projection_graph(int seq_len);
+    VoxCPMCachedGraph& ensure_fsq_2d_graph(int seq_len);
+    VoxCPMCachedGraph& ensure_stop_predictor_graph();
+    VoxCPMCachedGraph& ensure_locenc_patch_to_lm_embed_graph();
 
+    void run_locenc_patch_into(const float* patch_data, float* output_data);
     std::vector<float> run_locenc_patch(const float* patch_data);
     std::vector<float> run_embedding(const std::vector<int32_t>& token_ids);
     std::vector<float> run_projection_1d(LinearProjection& projection,
@@ -181,6 +210,12 @@ private:
     VoxCPMBackend* backend_ = nullptr;
     VoxCPMImatrixCollector* imatrix_collector_ = nullptr;
     std::shared_ptr<VoxCPMWeightStore> weight_store_;
+    VoxCPMCachedGraph locenc_patch_graph_;
+    std::unordered_map<int, VoxCPMCachedGraph> embedding_graphs_;
+    std::unordered_map<int, VoxCPMCachedGraph> enc_to_lm_projection_graphs_;
+    std::unordered_map<int, VoxCPMCachedGraph> fsq_2d_graphs_;
+    VoxCPMCachedGraph stop_predictor_graph_;
+    VoxCPMCachedGraph locenc_patch_to_lm_embed_graph_;
 };
 
 }  // namespace voxcpm

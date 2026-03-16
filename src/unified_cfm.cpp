@@ -51,43 +51,12 @@ ggml_tensor* UnifiedCFM::compute_velocity_with_cfg(VoxCPMContext& ctx,
     VOXCPM_UNUSED(dt);
 
     ggml_context* raw = ctx.raw_context();
-    const int64_t feat_dim = x->ne[0];
-    const int64_t seq_len = x->ne[1];
-    const int64_t cond_len = cond->ne[1];
-    const int64_t hidden_size = mu->ne[0];
-
-    ggml_tensor* x_target = ggml_new_tensor_3d(raw, GGML_TYPE_F32, feat_dim, seq_len, 2);
-    ggml_tensor* x_in = ggml_repeat(raw, x, x_target);
-
-    ggml_tensor* cond_target = ggml_new_tensor_3d(raw, GGML_TYPE_F32, feat_dim, cond_len, 2);
-    ggml_tensor* cond_in = ggml_repeat(raw, cond, cond_target);
-
-    ggml_tensor* mu_2d = ggml_reshape_2d(raw, mu, hidden_size, 1);
-    ggml_tensor* mu_target = ggml_new_tensor_2d(raw, GGML_TYPE_F32, hidden_size, 2);
-    ggml_tensor* mu_repeat = ggml_repeat(raw, mu_2d, mu_target);
-    ggml_tensor* mu_mask = ggml_arange(raw, 0.0f, 2.0f, 1.0f);
-    mu_mask = ggml_scale(raw, mu_mask, -1.0f);
-    mu_mask = ggml_add1(raw, mu_mask, ggml_arange(raw, 1.0f, 2.0f, 1.0f));
-    mu_mask = ggml_reshape_2d(raw, mu_mask, 1, 2);
-    ggml_tensor* mu_mask_broadcast = ggml_repeat(raw, mu_mask, mu_repeat);
-    ggml_tensor* mu_in = ggml_mul(raw, mu_repeat, mu_mask_broadcast);
 
     ggml_tensor* t_scalar = ggml_arange(raw, t, t + 1.0f, 1.0f);
-    ggml_tensor* t_target = ggml_new_tensor_1d(raw, GGML_TYPE_F32, 2);
-    ggml_tensor* t_in = ggml_repeat(raw, t_scalar, t_target);
-
     ggml_tensor* zero_scalar = ggml_arange(raw, 0.0f, 1.0f, 1.0f);
-    ggml_tensor* dt_target = ggml_new_tensor_1d(raw, GGML_TYPE_F32, 2);
-    ggml_tensor* dt_in = ggml_repeat(raw, zero_scalar, dt_target);
-
-    ggml_tensor* velocity = estimator_.forward(ctx, x_in, mu_in, t_in, cond_in, dt_in);
-    ggml_tensor* dphi_dt_cond = ggml_view_2d(raw, velocity, feat_dim, seq_len, velocity->nb[1], 0);
-    ggml_tensor* dphi_dt_uncond = ggml_view_2d(raw,
-                                               velocity,
-                                               feat_dim,
-                                               seq_len,
-                                               velocity->nb[1],
-                                               velocity->nb[2]);
+    ggml_tensor* dphi_dt_cond = nullptr;
+    ggml_tensor* dphi_dt_uncond = nullptr;
+    estimator_.forward_cfg_pair(ctx, x, mu, t_scalar, cond, zero_scalar, &dphi_dt_cond, &dphi_dt_uncond);
 
     if (use_cfg_zero_star) {
         ggml_tensor* st_star = optimized_scale(ctx, dphi_dt_cond, dphi_dt_uncond);

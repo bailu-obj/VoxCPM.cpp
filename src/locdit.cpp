@@ -274,4 +274,27 @@ ggml_tensor* LocDiTModel::forward(VoxCPMContext& ctx,
     return ggml_add1(raw, output, sync);
 }
 
+void LocDiTModel::forward_cfg_pair(VoxCPMContext& ctx,
+                                   ggml_tensor* x,
+                                   ggml_tensor* mu,
+                                   ggml_tensor* t_scalar,
+                                   ggml_tensor* cond,
+                                   ggml_tensor* dt_scalar,
+                                   ggml_tensor** conditioned,
+                                   ggml_tensor** unconditioned) {
+    VOXCPM_ASSERT(conditioned != nullptr);
+    VOXCPM_ASSERT(unconditioned != nullptr);
+    VOXCPM_ASSERT(x != nullptr);
+    VOXCPM_ASSERT(mu != nullptr);
+    VOXCPM_ASSERT(t_scalar != nullptr);
+    VOXCPM_ASSERT(cond != nullptr);
+    VOXCPM_ASSERT(dt_scalar != nullptr);
+
+    *conditioned = forward_single(ctx, x, mu, t_scalar, cond, dt_scalar);
+
+    ggml_context* raw = ctx.raw_context();
+    ggml_tensor* mu_zero = ggml_scale(raw, mu, 0.0f);
+    *unconditioned = forward_single(ctx, x, mu_zero, t_scalar, cond, dt_scalar);
+}
+
 }  // namespace voxcpm
