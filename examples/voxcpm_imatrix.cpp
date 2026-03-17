@@ -351,7 +351,7 @@ std::vector<float> extract_prompt_features(AudioVAE& audio_vae,
                                            int patch_size,
                                            int feat_dim) {
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
-    ggml_tensor* latent = audio_vae.encode(graph_ctx, audio, sample_rate);
+    ggml_tensor* latent = audio_vae.encode(graph_ctx, backend, audio, sample_rate);
     if (!latent) {
         fail("Failed to build AudioVAE encode graph");
     }
@@ -455,7 +455,7 @@ void collect_decode_audio_imatrix(AudioVAE& audio_vae,
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
     ggml_tensor* latent_tensor = graph_ctx.new_tensor_2d(GGML_TYPE_F32, total_patches, feat_dim);
     ggml_set_input(latent_tensor);
-    ggml_tensor* audio = audio_vae.decode(graph_ctx, latent_tensor);
+    ggml_tensor* audio = audio_vae.decode(graph_ctx, backend, latent_tensor);
     if (!audio) {
         fail("Failed to build AudioVAE decode graph");
     }

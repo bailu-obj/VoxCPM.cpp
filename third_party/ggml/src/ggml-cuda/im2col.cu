@@ -1,6 +1,6 @@
 #include "im2col.cuh"
 
-#define MAX_GRIDDIM_Z 65535
+#define MAX_GRIDDIM_COMPONENT 65535
 
 template <typename T>
 static  __global__ void im2col_kernel(
@@ -8,7 +8,10 @@ static  __global__ void im2col_kernel(
         int64_t IC, int64_t IW, int64_t IH, int64_t OH, int64_t OW, int64_t KW, int64_t KH,
         int64_t IC_IH_IW, int64_t IH_IW, int64_t N_OH, int64_t KH_KW, int64_t IC_KH_KW,
         int s0, int s1, int p0, int p1, int d0, int d1) {
-    const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int64_t flat_x = blockIdx.x;
+    const int64_t iow = flat_x % OW;
+    const int64_t i_block = flat_x / OW;
+    const int64_t i = threadIdx.x + i_block * blockDim.x;
     if (i >= IC_KH_KW) {
         return;
     }
@@ -18,8 +21,7 @@ static  __global__ void im2col_kernel(
     const int64_t ikh = rem / KW;
     const int64_t ikw = rem - ikh * KW;
 
-    const int64_t  iow = blockIdx.y;
-    for (int64_t iz = blockIdx.z; iz < N_OH; iz+=MAX_GRIDDIM_Z) {
+    for (int64_t iz = blockIdx.y; iz < N_OH; iz += MAX_GRIDDIM_COMPONENT) {
         const int64_t  in = iz / OH;
         const int64_t  ioh = iz - in * OH;
 
@@ -51,7 +53,15 @@ static void im2col_cuda(const float * x, T* dst,
     const int64_t num_blocks = (IC_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
     const int64_t N_OH = N * OH;
     const int64_t KH_KW = KW*KH;
-    dim3 block_nums(num_blocks, OW, MIN(N_OH, MAX_GRIDDIM_Z));
+
+    // Long 1D audio widths can exceed CUDA's grid.y limit, so fold OW into grid.x.
+    GGML_ASSERT(num_blocks > 0);
+    GGML_ASSERT(OW > 0);
+    GGML_ASSERT(num_blocks <= UINT32_MAX / OW);
+
+    dim3 block_nums(static_cast<uint32_t>(num_blocks * OW),
+                    static_cast<uint32_t>(MIN(N_OH, MAX_GRIDDIM_COMPONENT)),
+                    1);
     im2col_kernel<<<block_nums, MIN(IC_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(x, dst, IC, IW, IH, OH, OW, KW, KH,
                                                                                      IC_IH_IW, IH_IW, N_OH, KH_KW, IC_KH_KW,
                                                                                      s0, s1, p0, p1, d0, d1);
@@ -124,7 +134,10 @@ static  __global__ void im2col_3d_kernel(
         int64_t OW_IC_KD_KH_KW, int64_t N_OD_OH, int64_t OD_OH,
         int64_t stride_q, int64_t stride_z, int64_t stride_y, int64_t stride_x,
         int s0, int s1, int s2, int p0, int p1, int p2, int d0, int d1, int d2) {
-    const int64_t i = threadIdx.x + blockIdx.x * blockDim.x;
+    const int64_t flat_x = blockIdx.x;
+    const int64_t iow = flat_x % OW;
+    const int64_t i_block = flat_x / OW;
+    const int64_t i = threadIdx.x + i_block * blockDim.x;
     if (i >= IC_KD_KH_KW) {
         return;
     }
@@ -136,8 +149,7 @@ static  __global__ void im2col_3d_kernel(
     const int64_t ikh = (i - iic * KD_KH_KW - ikd * KH_KW) / KW;
     const int64_t ikw = i % KW;
 
-    const int64_t  iow = blockIdx.y;
-    for (int64_t iz = blockIdx.z; iz < N_OD_OH; iz+=MAX_GRIDDIM_Z) {
+    for (int64_t iz = blockIdx.y; iz < N_OD_OH; iz += MAX_GRIDDIM_COMPONENT) {
         const int64_t in  = iz / OD_OH;
         const int64_t iod = (iz - in*OD_OH) / OH;
         const int64_t ioh = iz % OH;
@@ -178,7 +190,14 @@ static void im2col_3d_cuda(const float * src, T* dst,
     const int64_t OH_OW_IC_KD_KH_KW = OH*OW*IC*KD*KH*KW;
     const int64_t OW_IC_KD_KH_KW = OW*IC*KD*KH*KW;
     const int64_t num_blocks = (IC_KD_KH_KW + CUDA_IM2COL_BLOCK_SIZE - 1) / CUDA_IM2COL_BLOCK_SIZE;
-    dim3 block_nums(num_blocks, OW, MIN(N_OD_OH, MAX_GRIDDIM_Z));
+
+    GGML_ASSERT(num_blocks > 0);
+    GGML_ASSERT(OW > 0);
+    GGML_ASSERT(num_blocks <= UINT32_MAX / OW);
+
+    dim3 block_nums(static_cast<uint32_t>(num_blocks * OW),
+                    static_cast<uint32_t>(MIN(N_OD_OH, MAX_GRIDDIM_COMPONENT)),
+                    1);
     im2col_3d_kernel<<<block_nums, MIN(IC_KD_KH_KW, CUDA_IM2COL_BLOCK_SIZE) , 0, stream>>>(src, dst, N, IC, ID, IH, IW, OC, KD, KH, KW, OD, OH, OW,
                                                                                            OH_OW, KD_KH_KW, ID_IH_IW, KH_KW, IH_IW, IC_ID_IH_IW,
                                                                                            IC_KD_KH_KW, OW_KD_KH_KW, OD_OH_OW_IC_KD_KH_KW,

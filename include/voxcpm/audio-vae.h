@@ -77,8 +77,13 @@ public:
 
     std::vector<float> preprocess(std::vector<float> audio_data, int sample_rate = -1) const;
 
-    ggml_tensor* encode(VoxCPMContext& ctx, std::vector<float>& audio_data, int sample_rate = -1);
-    ggml_tensor* decode(VoxCPMContext& ctx, ggml_tensor* z);
+    ggml_tensor* encode(VoxCPMContext& ctx,
+                        const VoxCPMBackend& backend,
+                        std::vector<float>& audio_data,
+                        int sample_rate = -1);
+    ggml_tensor* decode(VoxCPMContext& ctx,
+                        const VoxCPMBackend& backend,
+                        ggml_tensor* z);
 
     const AudioVAEConfig& config() const { return config_; }
     const AudioVAEWeights& weights() const { return weights_; }
@@ -98,6 +103,7 @@ private:
                                int padding) const;
 
     ggml_tensor* causal_conv1d_dw(ggml_context* ctx,
+                                  const VoxCPMBackend& backend,
                                   ggml_tensor* x,
                                   ggml_tensor* weight,
                                   ggml_tensor* bias,
@@ -114,21 +120,26 @@ private:
                                          int output_padding) const;
 
     ggml_tensor* residual_unit_forward(ggml_context* ctx,
+                                       const VoxCPMBackend& backend,
                                        ggml_tensor* x,
                                        const ResidualUnitWeights& weights,
                                        int dilation) const;
 
     ggml_tensor* encoder_block_forward(ggml_context* ctx,
+                                       const VoxCPMBackend& backend,
                                        ggml_tensor* x,
                                        const EncoderBlockWeights& weights,
                                        int stride) const;
 
     ggml_tensor* decoder_block_forward(ggml_context* ctx,
+                                       const VoxCPMBackend& backend,
                                        ggml_tensor* x,
                                        const DecoderBlockWeights& weights,
                                        int stride) const;
 
-    ggml_tensor* encode_tensor(VoxCPMContext& ctx, ggml_tensor* audio) const;
+    ggml_tensor* encode_tensor(VoxCPMContext& ctx,
+                               const VoxCPMBackend& backend,
+                               ggml_tensor* audio) const;
 
     bool load_tensor_data(FILE* file,
                           gguf_context* gguf_ctx,

@@ -533,7 +533,9 @@ ggml_tensor* MiniCPMModel::attention_forward(ggml_context* ctx,
     if (write_kv_cache) {
         ggml_tensor* k_write = ggml_cpy(ctx, k, kv_cache.get_k_batch(ctx, layer_idx, n_past, n_tokens));
         ggml_tensor* v_write = ggml_cpy(ctx, v, kv_cache.get_v_batch(ctx, layer_idx, n_past, n_tokens));
-        kv_sync = ggml_add(ctx, ggml_sum(ctx, k_write), ggml_sum(ctx, v_write));
+        kv_sync = ggml_add(ctx,
+                           ggml_sum(ctx, ggml_cont(ctx, k_write)),
+                           ggml_sum(ctx, ggml_cont(ctx, v_write)));
         kv_sync = ggml_scale(ctx, kv_sync, 0.0f);
     }
     ggml_tensor* k_cur = ggml_permute(ctx, k, 0, 2, 1, 3);

@@ -23,6 +23,7 @@ endfunction()
 
 # FSQ tests
 voxcpm_add_test(test_audio_vae test_audio_vae.cpp)
+voxcpm_add_test(test_cuda_backend test_cuda_backend.cpp)
 voxcpm_add_test(test_fsq test_fsq.cpp)
 
 # Components tests

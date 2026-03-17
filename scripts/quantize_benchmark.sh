@@ -168,7 +168,7 @@ for model in "${MODELS[@]}"; do
             --threads 4 \
             2>&1 | tee "${log_file}"
         quant_end=$(date +%s.%N)
-        quant_time=$(echo "${quant_end} - ${quant_start}" | bc)
+        quant_time=$(awk "BEGIN {printf \"%.2f\", ${quant_end} - ${quant_start}}")
 
         if [[ ! -f "${output_path}" ]]; then
             log_error "  Quantization failed for ${output_name}"
@@ -193,7 +193,7 @@ for model in "${MODELS[@]}"; do
             --backend "${BACKEND}" \
             2>&1 | tee -a "${log_file}"
         tts_end=$(date +%s.%N)
-        tts_time=$(echo "${tts_end} - ${tts_start}" | bc)
+        tts_time=$(awk "BEGIN {printf \"%.2f\", ${tts_end} - ${tts_start}}")
 
         # Extract detailed timing info from TTS output
         vae_encode=$(extract_timing_info "${log_file}" "vae_encode")
@@ -216,7 +216,7 @@ for model in "${MODELS[@]}"; do
         echo "Model: ${model} | Quant: ${quant_type}" >> "${SUMMARY_FILE}"
         echo "  Original size: ${original_size} MB" >> "${SUMMARY_FILE}"
         echo "  Quantized size: ${quant_size} MB" >> "${SUMMARY_FILE}"
-        echo "  Compression ratio: $(echo "scale=2; ${original_size} / ${quant_size}" | bc)x" >> "${SUMMARY_FILE}"
+        echo "  Compression ratio: $(awk "BEGIN {printf \"%.2fx\", ${original_size} / ${quant_size}}")" >> "${SUMMARY_FILE}"
         echo "  Quantization time: ${quant_time}s" >> "${SUMMARY_FILE}"
         echo "" >> "${SUMMARY_FILE}"
         echo "  === Inference Timing ===" >> "${SUMMARY_FILE}"
@@ -231,7 +231,7 @@ for model in "${MODELS[@]}"; do
         echo "  Without AudioVAE Encode: ${rtf_without_encode}  (model + decode)" >> "${SUMMARY_FILE}"
         echo "  Full pipeline:          ${rtf_full}" >> "${SUMMARY_FILE}"
 
-        append_table_row "${model}" "${quant_type}" "${quant_size}" "$(echo "scale=2; ${original_size} / ${quant_size}" | bc)x" \
+        append_table_row "${model}" "${quant_type}" "${quant_size}" "$(awk "BEGIN {printf \"%.2fx\", ${original_size} / ${quant_size}}")" \
             "${quant_time}" "${total_time}" "${rtf_model_only}" "${rtf_without_encode}" "${rtf_full}"
 
         log_info "  Done. RTF (Without AudioVAE Encode): ${rtf_without_encode}, Total: ${total_time}s"
@@ -260,7 +260,7 @@ for model in "${MODELS[@]}"; do
         --backend "${BACKEND}" \
         2>&1 | tee "${f32_log_file}"
     f32_tts_end=$(date +%s.%N)
-    f32_tts_time=$(echo "${f32_tts_end} - ${f32_tts_start}" | bc)
+    f32_tts_time=$(awk "BEGIN {printf \"%.2f\", ${f32_tts_end} - ${f32_tts_start}}")
 
     f32_size=$(get_size_mb "${f32_output_path}")
     f32_vae_encode=$(extract_timing_info "${f32_log_file}" "vae_encode")

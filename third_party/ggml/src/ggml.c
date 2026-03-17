@@ -4471,8 +4471,10 @@ struct ggml_tensor * ggml_conv_1d_dw(
         int                   p0,
         int                   d0) {
     struct ggml_tensor * new_b = ggml_reshape_4d(ctx, b, b->ne[0], 1, b->ne[1], b->ne[2]);
+    const enum ggml_type im2col_type =
+        (a->type == GGML_TYPE_F16 && b->type == GGML_TYPE_F16) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, GGML_TYPE_F16);
+    struct ggml_tensor * im2col = ggml_im2col(ctx, a, new_b, s0, 0, p0, 0, d0, 0, false, im2col_type);
 
     struct ggml_tensor * result = ggml_mul_mat(ctx, im2col, a);
 

@@ -965,7 +965,7 @@ VoxCPMDecodeResult VoxCPMRuntime::decode(VoxCPMDecodeState state,
     backend_->tensor_get(residual_step.output, residual_hidden.data(), 0, residual_hidden.size() * sizeof(float));
 
     state.lm_hidden = std::move(lm_hidden);
-    state.residual_hidden = residual_hidden;
+    state.residual_hidden = std::move(residual_hidden);
     state.current_position = new_position;
     state.prefix_feat_cond = result.output_0;
 

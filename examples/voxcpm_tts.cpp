@@ -138,13 +138,16 @@ BackendType parse_backend_type(const std::string& value) {
     if (value == "cpu") {
         return BackendType::CPU;
     }
+    if (value == "cuda") {
+        return BackendType::CUDA;
+    }
     if (value == "vulkan") {
         return BackendType::Vulkan;
     }
     if (value == "auto") {
         return BackendType::Auto;
     }
-    fail("Unsupported backend: " + value + " (expected cpu, vulkan, or auto)");
+    fail("Unsupported backend: " + value + " (expected cpu, cuda, vulkan, or auto)");
 }
 
 void print_usage(const char* argv0) {
@@ -157,7 +160,7 @@ void print_usage(const char* argv0) {
               << "  --prompt-text, -pt PROMPT_TEXT\n"
               << "  --cfg-value FLOAT (default: 2.0)\n"
               << "  --inference-timesteps INT (default: 10)\n"
-              << "  --backend {cpu|vulkan|auto} (default: cpu)\n"
+              << "  --backend {cpu|cuda|vulkan|auto} (default: cpu)\n"
               << "  --threads INT (default: 4)\n"
               << "  --stream\n"
               << "  --stream-dir DIR\n"
@@ -458,7 +461,7 @@ std::vector<float> extract_prompt_features(AudioVAE& audio_vae,
                                            int feat_dim) {
     std::cerr << "Encoding prompt audio...\n";
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
-    ggml_tensor* latent = audio_vae.encode(graph_ctx, audio, sample_rate);
+    ggml_tensor* latent = audio_vae.encode(graph_ctx, backend, audio, sample_rate);
     if (!latent) {
         fail("Failed to build AudioVAE encode graph");
     }
@@ -509,7 +512,7 @@ std::vector<float> decode_audio(AudioVAE& audio_vae,
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
     ggml_tensor* latent = graph_ctx.new_tensor_2d(GGML_TYPE_F32, total_patches, feat_dim);
     ggml_set_input(latent);
-    ggml_tensor* audio = audio_vae.decode(graph_ctx, latent);
+    ggml_tensor* audio = audio_vae.decode(graph_ctx, backend, latent);
     if (!audio) {
         fail("Failed to build AudioVAE decode graph");
     }

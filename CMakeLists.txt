@@ -22,6 +22,7 @@ set(CMAKE_CXX_FLAGS_RELEASE "-O3")
 
 # Backend options
 option(VOXCPM_VULKAN "Enable Vulkan backend support through ggml" OFF)
+option(VOXCPM_CUDA "Enable CUDA backend support through ggml" OFF)
 option(VOXCPM_NATIVE "Optimize ggml for the current CPU" ON)
 
 # =============================================================================
@@ -31,6 +32,7 @@ option(VOXCPM_NATIVE "Optimize ggml for the current CPU" ON)
 # GGML
 set(GGML_DIR ${CMAKE_SOURCE_DIR}/third_party/ggml)
 set(GGML_VULKAN ${VOXCPM_VULKAN} CACHE BOOL "ggml: use Vulkan" FORCE)
+set(GGML_CUDA ${VOXCPM_CUDA} CACHE BOOL "ggml: use CUDA" FORCE)
 set(GGML_NATIVE ${VOXCPM_NATIVE} CACHE BOOL "ggml: optimize the build for the current system" FORCE)
 add_subdirectory(${GGML_DIR} ggml)
 

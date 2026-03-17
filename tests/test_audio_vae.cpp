@@ -13,6 +13,7 @@
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <nlohmann/json.hpp>
 #include <string>
 #include <vector>
@@ -29,6 +30,7 @@ const std::string kModelPath = get_model_path();
 const std::string kTraceEncodePath = get_trace_path("trace_AudioVAE_encode.jsonl");
 const std::string kTraceDecodePath = get_trace_path("trace_AudioVAE_decode.jsonl");
 constexpr float kTargetMaxDiff = 2e-4f;
+constexpr float kCudaSmokeMaxDiff = 1e-1f;
 
 int cpu_thread_count() {
     if (const char* env = std::getenv("VOXCPM_TEST_THREADS")) {
@@ -43,6 +45,15 @@ int cpu_thread_count() {
 bool file_exists(const std::string& path) {
     std::ifstream file(path, std::ios::binary);
     return file.good();
+}
+
+std::unique_ptr<VoxCPMBackend> try_create_cuda_backend() {
+    try {
+        return std::make_unique<VoxCPMBackend>(BackendType::CUDA, cpu_thread_count());
+    } catch (const std::exception& e) {
+        WARN("CUDA backend unavailable, skipping test: " << e.what());
+        return nullptr;
+    }
 }
 
 json load_jsonl_line(const std::string& path, int line_index) {
@@ -139,6 +150,12 @@ ErrorStats compute_error_stats(const std::vector<float>& actual, const std::vect
     stats.mean_abs_diff = static_cast<float>(sum_abs / n);
     stats.rmse = static_cast<float>(std::sqrt(sum_sq / n));
     return stats;
+}
+
+bool all_finite(const std::vector<float>& values) {
+    return std::all_of(values.begin(), values.end(), [](float value) {
+        return std::isfinite(value);
+    });
 }
 
 void print_error_stats(const char* label,
@@ -280,7 +297,7 @@ TEST_CASE("AudioVAE encode matches trace", "[audio_vae][encode][trace]") {
     REQUIRE(vae.load_from_gguf(kModelPath, weight_ctx, graph_ctx, backend));
 
     std::vector<float> audio_copy = input_audio;
-    ggml_tensor* latent = vae.encode(graph_ctx, audio_copy, 44100);
+    ggml_tensor* latent = vae.encode(graph_ctx, backend, audio_copy, 44100);
     REQUIRE(latent != nullptr);
     REQUIRE(latent->ne[0] == 216);
     REQUIRE(latent->ne[1] == 64);
@@ -325,7 +342,7 @@ TEST_CASE("AudioVAE decode matches trace", "[audio_vae][decode][trace]") {
     ggml_tensor* latent = graph_ctx.new_tensor_3d(GGML_TYPE_F32, 36, 64, 1);
     REQUIRE(latent != nullptr);
     ggml_set_input(latent);
-    ggml_tensor* audio = vae.decode(graph_ctx, latent);
+    ggml_tensor* audio = vae.decode(graph_ctx, backend, latent);
     REQUIRE(audio != nullptr);
     REQUIRE(audio->ne[0] == 63504);
     REQUIRE(audio->ne[1] == 1);
@@ -349,6 +366,95 @@ TEST_CASE("AudioVAE decode matches trace", "[audio_vae][decode][trace]") {
     INFO("decode mean_abs_diff = " << stats.mean_abs_diff);
     INFO("decode rmse = " << stats.rmse);
     REQUIRE(stats.max_abs_diff <= kTargetMaxDiff);
+}
+
+TEST_CASE("AudioVAE encode CUDA smoke", "[audio_vae][encode][cuda][smoke]") {
+    if (!file_exists(kModelPath) || !file_exists(kTraceEncodePath)) {
+        WARN("Encode test dependencies missing, skipping test");
+        return;
+    }
+
+    auto backend = try_create_cuda_backend();
+    if (!backend) {
+        return;
+    }
+
+    const json trace = load_jsonl_line(kTraceEncodePath, 0);
+    std::vector<float> input_audio = flatten_bt_to_t(trace.at("inputs").at("audio_data"));
+    const std::vector<float> expected = flatten_bct_to_tc(trace.at("outputs").at("output"));
+
+    VoxCPMContext weight_ctx(ContextType::Weights, 512);
+    VoxCPMContext graph_ctx(ContextType::Graph, 65536, 262144);
+
+    AudioVAE vae;
+    REQUIRE(vae.load_from_gguf(kModelPath, weight_ctx, graph_ctx, *backend));
+
+    std::vector<float> audio_copy = input_audio;
+    ggml_tensor* latent = vae.encode(graph_ctx, *backend, audio_copy, 44100);
+    REQUIRE(latent != nullptr);
+
+    const GraphTimingStats timing = run_graph_with_timing(graph_ctx, *backend, latent, [&]() {
+        backend->tensor_set(vae.last_input_tensor(),
+                            vae.last_preprocessed_audio().data(),
+                            0,
+                            vae.last_preprocessed_audio().size() * sizeof(float));
+    });
+
+    std::vector<float> actual(expected.size(), 0.0f);
+    backend->tensor_get(latent, actual.data(), 0, actual.size() * sizeof(float));
+
+    REQUIRE(all_finite(actual));
+    const ErrorStats stats = compute_error_stats(actual, expected);
+    print_error_stats("AudioVAE encode CUDA output", input_audio, expected, actual, stats, kCudaSmokeMaxDiff);
+    print_graph_timing("AudioVAE encode CUDA", timing);
+    INFO("encode CUDA max_abs_diff = " << stats.max_abs_diff);
+    REQUIRE(stats.max_abs_diff <= kCudaSmokeMaxDiff);
+}
+
+TEST_CASE("AudioVAE decode CUDA smoke", "[audio_vae][decode][cuda][smoke]") {
+    if (!file_exists(kModelPath) || !file_exists(kTraceDecodePath)) {
+        WARN("Decode test dependencies missing, skipping test");
+        return;
+    }
+
+    auto backend = try_create_cuda_backend();
+    if (!backend) {
+        return;
+    }
+
+    const json trace = load_jsonl_line(kTraceDecodePath, 0);
+    const std::vector<float> latent_input = flatten_bct_to_tc(trace.at("inputs").at("z"));
+    const std::vector<float> expected = flatten_bct_to_tc(trace.at("outputs").at("output"));
+
+    VoxCPMContext weight_ctx(ContextType::Weights, 512);
+    VoxCPMContext graph_ctx(ContextType::Graph, 65536, 262144);
+
+    AudioVAE vae;
+    REQUIRE(vae.load_from_gguf(kModelPath, weight_ctx, graph_ctx, *backend));
+
+    ggml_tensor* latent = graph_ctx.new_tensor_3d(GGML_TYPE_F32, 36, 64, 1);
+    REQUIRE(latent != nullptr);
+    ggml_set_input(latent);
+    ggml_tensor* audio = vae.decode(graph_ctx, *backend, latent);
+    REQUIRE(audio != nullptr);
+
+    const GraphTimingStats timing = run_graph_with_timing(graph_ctx, *backend, audio, [&]() {
+        backend->tensor_set(latent, latent_input.data(), 0, latent_input.size() * sizeof(float));
+    });
+
+    std::vector<float> actual(expected.size(), 0.0f);
+    backend->tensor_get(audio, actual.data(), 0, actual.size() * sizeof(float));
+
+    REQUIRE(all_finite(actual));
+    const auto [min_it, max_it] = std::minmax_element(actual.begin(), actual.end());
+    REQUIRE(*min_it >= -1.01f);
+    REQUIRE(*max_it <= 1.01f);
+
+    const ErrorStats stats = compute_error_stats(actual, expected);
+    print_error_stats("AudioVAE decode CUDA output", latent_input, expected, actual, stats, kCudaSmokeMaxDiff);
+    print_graph_timing("AudioVAE decode CUDA", timing);
+    INFO("decode CUDA max_abs_diff = " << stats.max_abs_diff);
+    REQUIRE(stats.max_abs_diff <= kCudaSmokeMaxDiff);
 }
 
 }  // namespace test
