@@ -15,6 +15,7 @@
 namespace voxcpm {
 
 class VoxCPMBackend;
+class UnifiedCFM;
 class VoxCPMWeightStore;
 
 struct LocDiTWeights {
@@ -70,6 +71,10 @@ public:
                           ggml_tensor** conditioned,
                           ggml_tensor** unconditioned);
 
+    // Precompute the zero-delta CFG time table used by UnifiedCFM cached
+    // graphs. The result is laid out as [hidden_size, t_values.size()].
+    std::vector<float> precompute_cfg_time_table(const std::vector<float>& t_values) const;
+
     const MiniCPMConfig& config() const { return decoder_.config(); }
     const LocDiTWeights& weights() const { return weights_; }
     int feat_dim() const { return feat_dim_; }
@@ -78,6 +83,8 @@ public:
     bool uses_shared_weights() const { return shared_store_ != nullptr; }
 
 private:
+    friend class UnifiedCFM;
+
     ggml_tensor* sinusoidal_embedding(VoxCPMContext& ctx, ggml_tensor* scalar, int dim, float scale) const;
     ggml_tensor* timestep_mlp(VoxCPMContext& ctx,
                               ggml_tensor* input,
@@ -88,6 +95,29 @@ private:
 
     ggml_tensor* compute_time_embedding(VoxCPMContext& ctx, ggml_tensor* t_scalar) const;
     ggml_tensor* compute_delta_time_embedding(VoxCPMContext& ctx, ggml_tensor* dt_scalar) const;
+    ggml_tensor* project_input(VoxCPMContext& ctx, ggml_tensor* x) const;
+    ggml_tensor* project_condition(VoxCPMContext& ctx, ggml_tensor* cond) const;
+    ggml_tensor* build_combined_token(VoxCPMContext& ctx,
+                                      ggml_tensor* mu,
+                                      ggml_tensor* t_scalar,
+                                      ggml_tensor* dt_scalar) const;
+    ggml_tensor* build_cfg_pair_positions(VoxCPMContext& ctx, int branch_len) const;
+    ggml_tensor* build_cfg_pair_attention_mask(VoxCPMContext& ctx, int branch_len) const;
+    bool ensure_cfg_pair_constants(int branch_len);
+    ggml_tensor* forward_projected(VoxCPMContext& ctx,
+                                   ggml_tensor* x_proj,
+                                   ggml_tensor* combined_token,
+                                   ggml_tensor* cond_proj,
+                                   int prefix_len,
+                                   int seq_len);
+    void forward_cfg_pair_projected(VoxCPMContext& ctx,
+                                    ggml_tensor* x_proj,
+                                    ggml_tensor* mu,
+                                    ggml_tensor* combined_base,
+                                    ggml_tensor* cond_proj,
+                                    int prefix_len,
+                                    ggml_tensor** conditioned,
+                                    ggml_tensor** unconditioned);
 
     ggml_tensor* forward_single(VoxCPMContext& ctx,
                                 ggml_tensor* x,
@@ -105,6 +135,11 @@ private:
 
     ggml_context* weight_ctx_ = nullptr;
     ggml_backend_buffer_t weight_buffer_ = nullptr;
+    ggml_context* cfg_pair_ctx_ = nullptr;
+    ggml_backend_buffer_t cfg_pair_buffer_ = nullptr;
+    ggml_tensor* cfg_pair_positions_ = nullptr;
+    ggml_tensor* cfg_pair_attention_mask_ = nullptr;
+    int cfg_pair_branch_len_ = 0;
     VoxCPMBackend* backend_ = nullptr;
     std::unique_ptr<MiniCPMKVCache> scratch_kv_cache_;
     std::shared_ptr<VoxCPMWeightStore> shared_store_;

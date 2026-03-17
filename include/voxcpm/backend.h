@@ -13,6 +13,7 @@
 
 #include "common.h"
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 namespace voxcpm {
@@ -35,6 +36,15 @@ enum class BufferUsage {
     Weights,    // Read-only, persistent (model weights)
     KVCache,    // Read-write, persistent (KV cache)
     Compute,    // Read-write, dynamic (intermediate results)
+};
+
+struct BackendTransferStats {
+    size_t host_to_device_bytes = 0;
+    size_t device_to_host_bytes = 0;
+    size_t device_to_device_bytes = 0;
+    double host_to_device_ms = 0.0;
+    double device_to_host_ms = 0.0;
+    double device_to_device_ms = 0.0;
 };
 
 /**
@@ -207,6 +217,11 @@ public:
     ggml_gallocr_t allocator() const { return gallocr_; }
 
     /**
+     * @brief Check if multi-backend scheduler is active
+     */
+    bool uses_scheduler() const { return sched_ != nullptr; }
+
+    /**
      * @brief Get buffer type for this backend
      */
     ggml_backend_buffer_type_t buffer_type() const;
@@ -215,6 +230,16 @@ public:
      * @brief Get current compute arena size in bytes
      */
     size_t compute_buffer_size() const;
+
+    /**
+     * @brief Snapshot cumulative transfer statistics for this backend
+     */
+    BackendTransferStats transfer_stats() const { return transfer_stats_; }
+
+    /**
+     * @brief Reset cumulative transfer statistics for this backend
+     */
+    void reset_transfer_stats() { transfer_stats_ = {}; }
 
     /**
      * @brief Get backend type
@@ -245,11 +270,17 @@ private:
     BackendType type_;
     int n_threads_;
     ggml_backend_t backend_;
+    ggml_backend_t cpu_backend_ = nullptr;
     ggml_gallocr_t gallocr_;
+    ggml_backend_sched_t sched_ = nullptr;
+    size_t sched_graph_size_ = 0;
     bool is_gpu_ = false;
     bool allocator_logging_enabled_ = false;
+    bool scheduler_logging_enabled_ = false;
     std::string backend_name_;
     std::string backend_description_;
+    std::unordered_map<const ggml_cgraph*, bool> graph_scheduler_modes_;
+    BackendTransferStats transfer_stats_;
 
     // Track allocated buffers for cleanup
     std::vector<ggml_backend_buffer_t> buffers_;

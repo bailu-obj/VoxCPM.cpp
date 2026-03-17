@@ -11,6 +11,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <iomanip>
 #include <iostream>
 #include <sstream>
 
@@ -52,6 +53,31 @@ bool env_flag_enabled(const char* name) {
         return static_cast<char>(std::tolower(c));
     });
     return value == "1" || value == "true" || value == "yes" || value == "on";
+}
+
+BackendTransferStats transfer_stats_delta(const BackendTransferStats& before,
+                                          const BackendTransferStats& after) {
+    BackendTransferStats delta;
+    delta.host_to_device_bytes = after.host_to_device_bytes - before.host_to_device_bytes;
+    delta.device_to_host_bytes = after.device_to_host_bytes - before.device_to_host_bytes;
+    delta.device_to_device_bytes = after.device_to_device_bytes - before.device_to_device_bytes;
+    delta.host_to_device_ms = after.host_to_device_ms - before.host_to_device_ms;
+    delta.device_to_host_ms = after.device_to_host_ms - before.device_to_host_ms;
+    delta.device_to_device_ms = after.device_to_device_ms - before.device_to_device_ms;
+    return delta;
+}
+
+double bytes_to_mib(size_t bytes) {
+    return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+std::string format_transfer_stats(const BackendTransferStats& stats) {
+    std::ostringstream oss;
+    oss << std::fixed << std::setprecision(3)
+        << "h2d=" << bytes_to_mib(stats.host_to_device_bytes) << "MiB/" << stats.host_to_device_ms << "ms"
+        << " d2h=" << bytes_to_mib(stats.device_to_host_bytes) << "MiB/" << stats.device_to_host_ms << "ms"
+        << " d2d=" << bytes_to_mib(stats.device_to_device_bytes) << "MiB/" << stats.device_to_device_ms << "ms";
+    return oss.str();
 }
 
 }  // namespace
@@ -169,6 +195,13 @@ bool VoxCPMRuntime::load_from_store(const std::shared_ptr<VoxCPMWeightStore>& st
     cfm_config.sigma_min = config_.loc_dit.sigma_min;
     cfm_config.inference_cfg_rate = config_.loc_dit.cfg_rate;
     feat_decoder_ = std::make_unique<UnifiedCFM>(feat_decoder_estimator_, cfm_config);
+
+    if (backend_ && backend_->is_gpu()) {
+        for (int timesteps = 8; timesteps <= 12; ++timesteps) {
+            (void) get_precomputed_cfm_time_table(timesteps);
+        }
+    }
+
     return true;
 }
 
@@ -204,8 +237,32 @@ void VoxCPMRuntime::clear_cached_graphs() {
         entry.second.clear();
     }
     decode_front_half_graphs_.clear();
+    precomputed_cfm_time_tables_.clear();
     stop_predictor_graph_.clear();
     locenc_patch_to_lm_embed_graph_.clear();
+}
+
+bool VoxCPMRuntime::should_precompute_cfm_time_table(int n_timesteps) const {
+    return n_timesteps >= 8 && n_timesteps <= 12;
+}
+
+const std::vector<float>& VoxCPMRuntime::get_precomputed_cfm_time_table(int n_timesteps) {
+    VOXCPM_ASSERT(feat_decoder_ != nullptr);
+
+    auto [it, inserted] = precomputed_cfm_time_tables_.try_emplace(n_timesteps);
+    if (!inserted && !it->second.empty()) {
+        return it->second;
+    }
+
+    const std::vector<float> t_span = UnifiedCFM::compute_t_span(n_timesteps, feat_decoder_->config().sway_sampling_coef);
+    std::vector<float> t_values;
+    t_values.reserve(static_cast<size_t>(n_timesteps));
+    for (int step = 0; step < n_timesteps; ++step) {
+        t_values.push_back(t_span[static_cast<size_t>(step)]);
+    }
+
+    it->second = feat_decoder_estimator_.precompute_cfg_time_table(t_values);
+    return it->second;
 }
 
 VoxCPMCachedGraph& VoxCPMRuntime::ensure_locenc_patch_graph() {
@@ -343,6 +400,11 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_unified_cfm_graph(int n_timesteps, floa
     cached.input0 = graph_ctx.new_tensor_2d(GGML_TYPE_F32, config_.feat_dim, config_.patch_size);
     cached.input1 = graph_ctx.new_tensor_1d(GGML_TYPE_F32, config_.loc_dit.hidden_size);
     cached.input2 = graph_ctx.new_tensor_2d(GGML_TYPE_F32, config_.feat_dim, config_.patch_size);
+    if (should_precompute_cfm_time_table(n_timesteps)) {
+        cached.input4 = graph_ctx.new_tensor_2d(GGML_TYPE_F32, config_.loc_dit.hidden_size, n_timesteps);
+        ggml_set_input(cached.input4);
+        cached.aux_input4 = get_precomputed_cfm_time_table(n_timesteps);
+    }
     ggml_set_input(cached.input0);
     ggml_set_input(cached.input1);
     ggml_set_input(cached.input2);
@@ -352,7 +414,11 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_unified_cfm_graph(int n_timesteps, floa
                                            config_.patch_size,
                                            cached.input2,
                                            n_timesteps,
-                                           cfg_value);
+                                           cfg_value,
+                                           1.0f,
+                                           feat_decoder_->config().sway_sampling_coef,
+                                           feat_decoder_->config().use_cfg_zero_star,
+                                           cached.input4);
     ggml_set_output(cached.output);
 
     cached.graph = graph_ctx.new_graph();
@@ -380,6 +446,11 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_decode_front_half_graph(int n_timesteps
     cached.input1 = graph_ctx.new_tensor_1d(GGML_TYPE_F32, base_lm_.config().hidden_size);
     cached.input2 = graph_ctx.new_tensor_1d(GGML_TYPE_F32, residual_lm_.config().hidden_size);
     cached.input3 = graph_ctx.new_tensor_2d(GGML_TYPE_F32, config_.feat_dim, config_.patch_size);
+    if (should_precompute_cfm_time_table(n_timesteps)) {
+        cached.input4 = graph_ctx.new_tensor_2d(GGML_TYPE_F32, config_.loc_dit.hidden_size, n_timesteps);
+        ggml_set_input(cached.input4);
+        cached.aux_input4 = get_precomputed_cfm_time_table(n_timesteps);
+    }
     ggml_set_input(cached.input0);
     ggml_set_input(cached.input1);
     ggml_set_input(cached.input2);
@@ -394,11 +465,19 @@ VoxCPMCachedGraph& VoxCPMRuntime::ensure_decode_front_half_graph(int n_timesteps
                                            config_.patch_size,
                                            cached.input3,
                                            n_timesteps,
-                                           cfg_value);
+                                           cfg_value,
+                                           1.0f,
+                                           feat_decoder_->config().sway_sampling_coef,
+                                           feat_decoder_->config().use_cfg_zero_star,
+                                           cached.input4);
     ggml_set_output(cached.output);
 
+    ggml_tensor* patch_hidden = feat_encoder_.forward_patch(graph_ctx, cached.output);
+    cached.output_aux0 = components_->enc_to_lm_proj()->forward(graph_ctx, patch_hidden);
+    ggml_set_output(cached.output_aux0);
+
     cached.graph = graph_ctx.new_graph();
-    graph_ctx.build_forward(cached.graph, cached.output);
+    graph_ctx.build_forward(cached.graph, cached.output_aux0);
     backend_->reserve_compute_memory(cached.graph, "runtime.decode_front_half.cached");
     return cached;
 }
@@ -779,6 +858,9 @@ std::vector<float> VoxCPMRuntime::run_unified_cfm(const std::vector<float>& z,
     backend_->tensor_set(cached.input0, z.data(), 0, z.size() * sizeof(float));
     backend_->tensor_set(cached.input1, mu.data(), 0, mu.size() * sizeof(float));
     backend_->tensor_set(cached.input2, cond.data(), 0, cond.size() * sizeof(float));
+    if (cached.input4 && !cached.aux_input4.empty()) {
+        backend_->tensor_set(cached.input4, cached.aux_input4.data(), 0, cached.aux_input4.size() * sizeof(float));
+    }
     VOXCPM_ASSERT(backend_->compute(cached.graph) == GGML_STATUS_SUCCESS);
     maybe_collect_graph(cached.graph);
 
@@ -793,7 +875,8 @@ void VoxCPMRuntime::run_decode_front_half(const std::vector<float>& z,
                                           const std::vector<float>& prefix_feat_cond,
                                           int inference_timesteps,
                                           float cfg_value,
-                                          std::vector<float>& output_0) {
+                                          std::vector<float>& output_0,
+                                          std::vector<float>* curr_embed) {
     VOXCPM_ASSERT(backend_ != nullptr);
     VOXCPM_ASSERT(components_ != nullptr);
     VOXCPM_ASSERT(feat_decoder_ != nullptr);
@@ -808,11 +891,18 @@ void VoxCPMRuntime::run_decode_front_half(const std::vector<float>& z,
     backend_->tensor_set(cached.input1, lm_hidden.data(), 0, lm_hidden.size() * sizeof(float));
     backend_->tensor_set(cached.input2, residual_hidden.data(), 0, residual_hidden.size() * sizeof(float));
     backend_->tensor_set(cached.input3, prefix_feat_cond.data(), 0, prefix_feat_cond.size() * sizeof(float));
+    if (cached.input4 && !cached.aux_input4.empty()) {
+        backend_->tensor_set(cached.input4, cached.aux_input4.data(), 0, cached.aux_input4.size() * sizeof(float));
+    }
     VOXCPM_ASSERT(backend_->compute(cached.graph) == GGML_STATUS_SUCCESS);
     maybe_collect_graph(cached.graph);
 
     output_0.resize(static_cast<size_t>(config_.feat_dim * config_.patch_size));
     backend_->tensor_get(cached.output, output_0.data(), 0, output_0.size() * sizeof(float));
+    if (curr_embed != nullptr && cached.output_aux0 != nullptr) {
+        curr_embed->resize(static_cast<size_t>(base_lm_.config().hidden_size));
+        backend_->tensor_get(cached.output_aux0, curr_embed->data(), 0, curr_embed->size() * sizeof(float));
+    }
 }
 
 std::vector<float> VoxCPMRuntime::run_locenc_patch_to_lm_embed(const std::vector<float>& patch) {
@@ -944,26 +1034,32 @@ VoxCPMDecodeResult VoxCPMRuntime::decode(VoxCPMDecodeState state,
     VOXCPM_ASSERT(static_cast<int>(z.size()) == config_.feat_dim * config_.patch_size);
 
     const bool log_decode_timing = env_flag_enabled("VOXCPM_LOG_DECODE_TIMING");
+    const bool log_decode_transfers = env_flag_enabled("VOXCPM_LOG_DECODE_TRANSFERS");
     using clock = std::chrono::steady_clock;
     const auto decode_start = clock::now();
+    const BackendTransferStats transfers_before = backend_->transfer_stats();
 
     VoxCPMDecodeResult result;
+    std::vector<float> curr_embed;
     run_decode_front_half(z,
                           state.lm_hidden,
                           state.residual_hidden,
                           state.prefix_feat_cond,
                           inference_timesteps,
                           cfg_value,
-                          result.output_0);
+                          result.output_0,
+                          &curr_embed);
     const auto front_half_end = clock::now();
+    const BackendTransferStats transfers_after_front_half = backend_->transfer_stats();
 
     const int new_position = state.current_position + 1;
     const std::vector<float> stop_logits = run_stop_predictor(state.lm_hidden);
     result.output_2 = stop_logits.size() >= 2 && stop_logits[1] > stop_logits[0];
     const auto stop_end = clock::now();
+    const BackendTransferStats transfers_after_stop = backend_->transfer_stats();
 
-    const std::vector<float> curr_embed = run_locenc_patch_to_lm_embed(result.output_0);
     const auto patch_end = clock::now();
+    const BackendTransferStats transfers_after_patch = backend_->transfer_stats();
 
     VoxCPMCachedGraph& base_step = ensure_state_base_lm_step_graph(state, new_position);
     backend_->alloc_graph(base_step.graph, "runtime.base_lm.decode_step.state_cached");
@@ -975,6 +1071,7 @@ VoxCPMDecodeResult VoxCPMRuntime::decode(VoxCPMDecodeState state,
     std::vector<float> lm_hidden(static_cast<size_t>(base_lm_.config().hidden_size));
     backend_->tensor_get(base_step.output, lm_hidden.data(), 0, lm_hidden.size() * sizeof(float));
     const auto base_end = clock::now();
+    const BackendTransferStats transfers_after_base = backend_->transfer_stats();
 
     std::vector<float> residual_input(curr_embed.size(), 0.0f);
     for (size_t i = 0; i < residual_input.size(); ++i) {
@@ -990,6 +1087,7 @@ VoxCPMDecodeResult VoxCPMRuntime::decode(VoxCPMDecodeState state,
     std::vector<float> residual_hidden(static_cast<size_t>(residual_lm_.config().hidden_size));
     backend_->tensor_get(residual_step.output, residual_hidden.data(), 0, residual_hidden.size() * sizeof(float));
     const auto residual_end = clock::now();
+    const BackendTransferStats transfers_after_residual = backend_->transfer_stats();
 
     if (log_decode_timing) {
         const auto ms = [](clock::time_point begin, clock::time_point end) {
@@ -1003,6 +1101,17 @@ VoxCPMDecodeResult VoxCPMRuntime::decode(VoxCPMDecodeState state,
                   << " base_step_ms=" << ms(patch_end, base_end)
                   << " residual_step_ms=" << ms(base_end, residual_end)
                   << " total_ms=" << ms(decode_start, residual_end)
+                  << "\n";
+    }
+
+    if (log_decode_transfers) {
+        std::cerr << "[decode_transfer]"
+                  << " position=" << new_position
+                  << " front_half{" << format_transfer_stats(transfer_stats_delta(transfers_before, transfers_after_front_half)) << "}"
+                  << " stop{" << format_transfer_stats(transfer_stats_delta(transfers_after_front_half, transfers_after_stop)) << "}"
+                  << " patch_embed{" << format_transfer_stats(transfer_stats_delta(transfers_after_stop, transfers_after_patch)) << "}"
+                  << " base_step{" << format_transfer_stats(transfer_stats_delta(transfers_after_patch, transfers_after_base)) << "}"
+                  << " residual_step{" << format_transfer_stats(transfer_stats_delta(transfers_after_base, transfers_after_residual)) << "}"
                   << "\n";
     }
 

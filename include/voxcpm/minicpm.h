@@ -25,10 +25,12 @@ struct MiniCPMLayerWeights {
     ggml_tensor* q_proj = nullptr;
     ggml_tensor* k_proj = nullptr;
     ggml_tensor* v_proj = nullptr;
+    ggml_tensor* qkv_proj = nullptr;
     ggml_tensor* o_proj = nullptr;
     ggml_tensor* post_layernorm = nullptr;
     ggml_tensor* gate_proj = nullptr;
     ggml_tensor* up_proj = nullptr;
+    ggml_tensor* gate_up_proj = nullptr;
     ggml_tensor* down_proj = nullptr;
 };
 
@@ -103,7 +105,8 @@ public:
                          ggml_tensor* positions,
                          MiniCPMKVCache& kv_cache,
                          bool is_causal = true,
-                         bool write_kv_cache = true);
+                         bool write_kv_cache = true,
+                         ggml_tensor* attention_mask = nullptr);
 
     ggml_tensor* forward_step(VoxCPMContext& ctx,
                               ggml_tensor* input,
@@ -135,6 +138,7 @@ private:
                                    ggml_tensor* hidden,
                                    ggml_tensor* positions,
                                    ggml_tensor* causal_mask,
+                                   ggml_tensor* attention_mask,
                                    const MiniCPMLayerWeights& lw,
                                    MiniCPMKVCache& kv_cache,
                                    int layer_idx,
@@ -151,6 +155,7 @@ private:
                                ggml_tensor* hidden,
                                ggml_tensor* positions,
                                ggml_tensor* causal_mask,
+                               ggml_tensor* attention_mask,
                                const MiniCPMLayerWeights& lw,
                                MiniCPMKVCache& kv_cache,
                                int layer_idx,
@@ -161,6 +166,7 @@ private:
 
     bool update_config_from_gguf(gguf_context* gguf_ctx, const std::string& prefix);
     bool init_aux_tensors(VoxCPMBackend& backend);
+    bool init_fused_projection_tensors(VoxCPMBackend& backend, const std::string& prefix);
     bool load_weight_data(FILE* file, gguf_context* gguf_ctx);
 
     MiniCPMConfig config_;
@@ -171,6 +177,8 @@ private:
 
     ggml_context* aux_ctx_ = nullptr;
     ggml_backend_buffer_t aux_buffer_ = nullptr;
+    ggml_context* fused_weight_ctx_ = nullptr;
+    ggml_backend_buffer_t fused_weight_buffer_ = nullptr;
     ggml_tensor* rope_long_factor_ = nullptr;
     ggml_tensor* rope_short_factor_ = nullptr;
     ggml_tensor* pos_tensor_ = nullptr;

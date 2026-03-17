@@ -34,7 +34,8 @@ public:
                          float cfg_value,
                          float temperature = 1.0f,
                          float sway_sampling_coef = 1.0f,
-                         bool use_cfg_zero_star = true);
+                         bool use_cfg_zero_star = true,
+                         ggml_tensor* precomputed_time_table = nullptr);
 
     static std::vector<float> compute_t_span(int n_timesteps, float sway_sampling_coef);
 
@@ -49,9 +50,11 @@ private:
     ggml_tensor* compute_velocity_with_cfg(VoxCPMContext& ctx,
                                            ggml_tensor* x,
                                            ggml_tensor* mu,
-                                           ggml_tensor* cond,
+                                           ggml_tensor* cond_proj,
+                                           int prefix_len,
+                                           ggml_tensor* delta_time_zero,
+                                           ggml_tensor* combined_time_embedding,
                                            float t,
-                                           float dt,
                                            float cfg_value,
                                            bool use_cfg_zero_star);
 
@@ -59,7 +62,10 @@ private:
                              ggml_tensor* x,
                              const std::vector<float>& t_span,
                              ggml_tensor* mu,
-                             ggml_tensor* cond,
+                             ggml_tensor* cond_proj,
+                             int prefix_len,
+                             ggml_tensor* delta_time_zero,
+                             ggml_tensor* precomputed_time_table,
                              float cfg_value,
                              bool use_cfg_zero_star);
 

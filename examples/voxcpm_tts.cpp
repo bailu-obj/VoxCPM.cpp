@@ -109,6 +109,19 @@ int env_int_or_default(const char* name, int default_value) {
     }
 }
 
+int env_nonnegative_int_or_default(const char* name, int default_value) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') {
+        return default_value;
+    }
+
+    try {
+        return std::max(0, std::stoi(raw));
+    } catch (const std::exception&) {
+        return default_value;
+    }
+}
+
 double bytes_to_mib(size_t bytes) {
     return static_cast<double>(bytes) / (1024.0 * 1024.0);
 }
@@ -146,6 +159,76 @@ void log_memory_breakdown(bool enabled,
               << " tracked_total=" << bytes_to_mib(tracked_total) << " MiB"
               << "\n";
 }
+
+std::string format_duration_compact(double seconds) {
+    const int total_seconds = static_cast<int>(std::max(0.0, std::floor(seconds)));
+    const int hours = total_seconds / 3600;
+    const int minutes = (total_seconds % 3600) / 60;
+    const int secs = total_seconds % 60;
+
+    std::ostringstream oss;
+    if (hours > 0) {
+        oss << hours << ":" << std::setw(2) << std::setfill('0') << minutes
+            << ":" << std::setw(2) << secs;
+    } else {
+        oss << minutes << ":" << std::setw(2) << std::setfill('0') << secs;
+    }
+    return oss.str();
+}
+
+class DecodeProgressPrinter {
+public:
+    explicit DecodeProgressPrinter(int total_steps)
+        : total_steps_(std::max(1, total_steps)),
+          start_time_(std::chrono::steady_clock::now()) {}
+
+    void clear_line() {
+        if (!has_rendered_) {
+            return;
+        }
+        std::cerr << '\r' << std::string(last_width_, ' ') << '\r' << std::flush;
+        has_rendered_ = false;
+        last_width_ = 0;
+    }
+
+    void render(int completed_steps) {
+        const int clamped_steps = std::clamp(completed_steps, 0, total_steps_);
+        const auto now = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(now - start_time_).count();
+        const double safe_elapsed = std::max(elapsed, 1e-9);
+        const double it_per_sec = clamped_steps > 0 ? static_cast<double>(clamped_steps) / safe_elapsed : 0.0;
+        const double sec_per_it = clamped_steps > 0 ? safe_elapsed / static_cast<double>(clamped_steps) : 0.0;
+
+        std::ostringstream oss;
+        oss << "[decode] "
+            << clamped_steps << "/" << total_steps_
+            << " | elapsed " << format_duration_compact(elapsed)
+            << " | " << std::fixed << std::setprecision(2) << it_per_sec << " it/s"
+            << " | " << std::setprecision(3) << sec_per_it << " s/it";
+
+        const std::string line = oss.str();
+        last_width_ = std::max(last_width_, line.size());
+        std::cerr << '\r' << line;
+        if (line.size() < last_width_) {
+            std::cerr << std::string(last_width_ - line.size(), ' ');
+        }
+        std::cerr << std::flush;
+        has_rendered_ = true;
+    }
+
+    void finish(int completed_steps) {
+        render(completed_steps);
+        std::cerr << "\n";
+        has_rendered_ = false;
+        last_width_ = 0;
+    }
+
+private:
+    int total_steps_ = 0;
+    std::chrono::steady_clock::time_point start_time_;
+    size_t last_width_ = 0;
+    bool has_rendered_ = false;
+};
 
 BackendType parse_backend_type(const std::string& value) {
     if (value == "cpu") {
@@ -624,6 +707,100 @@ void append_stream_frame(std::vector<float>& recent_frames,
     }
 }
 
+void maybe_profile_front_half(bool enabled,
+                              VoxCPMRuntime& runtime,
+                              const VoxCPMDecodeState& state,
+                              int patch_size,
+                              int feat_dim,
+                              int inference_timesteps,
+                              float cfg_value) {
+    if (!enabled) {
+        return;
+    }
+
+    constexpr int kWarmupIters = 1;
+    constexpr int kMeasureIters = 3;
+
+    std::mt19937 rng(1234);
+    std::vector<float> noise;
+    fill_noise(noise, patch_size, feat_dim, rng);
+
+    volatile float checksum = 0.0f;
+    const auto measure_ms = [&](auto&& fn) {
+        for (int i = 0; i < kWarmupIters; ++i) {
+            checksum += fn();
+        }
+
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < kMeasureIters; ++i) {
+            checksum += fn();
+        }
+        const auto end = std::chrono::steady_clock::now();
+        return std::chrono::duration<double, std::milli>(end - start).count() /
+            static_cast<double>(kMeasureIters);
+    };
+
+    const double lm_proj_ms = measure_ms([&]() {
+        const std::vector<float> out = runtime.benchmark_run_lm_to_dit_projection(state.lm_hidden);
+        return out.empty() ? 0.0f : out.front();
+    });
+
+    const double res_proj_ms = measure_ms([&]() {
+        const std::vector<float> out = runtime.benchmark_run_res_to_dit_projection(state.residual_hidden);
+        return out.empty() ? 0.0f : out.front();
+    });
+
+    const std::vector<float> lm_proj = runtime.benchmark_run_lm_to_dit_projection(state.lm_hidden);
+    const std::vector<float> res_proj = runtime.benchmark_run_res_to_dit_projection(state.residual_hidden);
+
+    const double host_add_ms = measure_ms([&]() {
+        std::vector<float> mu = lm_proj;
+        for (size_t i = 0; i < mu.size(); ++i) {
+            mu[i] += res_proj[i];
+        }
+        return mu.empty() ? 0.0f : mu.front();
+    });
+
+    std::vector<float> mu = lm_proj;
+    for (size_t i = 0; i < mu.size(); ++i) {
+        mu[i] += res_proj[i];
+    }
+
+    const double unified_cfm_ms = measure_ms([&]() {
+        const std::vector<float> out = runtime.benchmark_run_unified_cfm(
+            noise, mu, state.prefix_feat_cond, inference_timesteps, cfg_value);
+        return out.empty() ? 0.0f : out.front();
+    });
+
+    const double fused_front_half_ms = measure_ms([&]() {
+        const std::vector<float> out = runtime.benchmark_run_decode_front_half(
+            noise,
+            state.lm_hidden,
+            state.residual_hidden,
+            state.prefix_feat_cond,
+            inference_timesteps,
+            cfg_value);
+        return out.empty() ? 0.0f : out.front();
+    });
+
+    const double split_total_ms = lm_proj_ms + res_proj_ms + host_add_ms + unified_cfm_ms;
+
+    std::cerr << std::fixed << std::setprecision(3)
+              << "\n=== Front-Half Profile ===\n"
+              << "  lm_to_dit_proj:      " << lm_proj_ms << " ms\n"
+              << "  res_to_dit_proj:     " << res_proj_ms << " ms\n"
+              << "  host_add(mu):        " << host_add_ms << " ms\n"
+              << "  unified_cfm:         " << unified_cfm_ms << " ms\n"
+              << "  -----------------------------\n"
+              << "  split_total:         " << split_total_ms << " ms\n"
+              << "  fused_front_half:    " << fused_front_half_ms << " ms\n"
+              << "  fused_vs_split_gap:  " << (fused_front_half_ms - split_total_ms) << " ms\n";
+
+    if (checksum == std::numeric_limits<float>::infinity()) {
+        std::cerr << "[front_half_profile] checksum overflow\n";
+    }
+}
+
 PreparedInputs prepare_inputs(const Options& options,
                               ChineseCharSplitTokenizer& split_tokenizer,
                               AudioVAE& audio_vae,
@@ -687,6 +864,7 @@ int main(int argc, char** argv) {
         const bool log_memory = env_flag_enabled("VOXCPM_LOG_MEMORY_BREAKDOWN");
         const bool log_decode_memory = env_flag_enabled("VOXCPM_LOG_DECODE_MEMORY");
         const int log_decode_memory_every = env_int_or_default("VOXCPM_LOG_DECODE_MEMORY_EVERY", 1);
+        const bool profile_front_half = env_flag_enabled("VOXCPM_PROFILE_FRONT_HALF");
 
         VoxCPMBackend backend(options.backend, options.threads);
         std::cerr << "Using backend: " << backend_type_name(backend.type())
@@ -743,10 +921,20 @@ int main(int argc, char** argv) {
                                                  seq_len,
                                                  kStreamingPrefixLen);
         log_memory_breakdown(log_memory, "post_prefill", *store, backend, &state);
+        maybe_profile_front_half(profile_front_half,
+                                 runtime,
+                                 state,
+                                 patch_size,
+                                 feat_dim,
+                                 options.inference_timesteps,
+                                 options.cfg_value);
 
         const int target_text_token_count =
             std::max<int>(1, static_cast<int>(split_tokenizer.tokenize(options.text).size()));
-        const int max_len = std::min(target_text_token_count * 6 + 10, 2000);
+        const int natural_max_len = std::min(target_text_token_count * 6 + 10, 2000);
+        const int benchmark_decode_steps = env_nonnegative_int_or_default("VOXCPM_BENCHMARK_DECODE_STEPS", 0);
+        const bool benchmark_ignore_stop = env_flag_enabled("VOXCPM_BENCHMARK_IGNORE_STOP");
+        const int max_len = benchmark_decode_steps > 0 ? benchmark_decode_steps : natural_max_len;
         constexpr int kMinLen = 2;
 
         std::mt19937 rng(std::random_device{}());
@@ -769,9 +957,15 @@ int main(int argc, char** argv) {
             }
         }
 
-        std::cerr << "Running decode loop, max_len=" << max_len << "...\n";
+        std::cerr << "Running decode loop, max_len=" << max_len;
+        if (benchmark_decode_steps > 0) {
+            std::cerr << " (benchmark_steps=" << benchmark_decode_steps
+                      << ", ignore_stop=" << (benchmark_ignore_stop ? 1 : 0) << ")";
+        }
+        std::cerr << "...\n";
+        DecodeProgressPrinter decode_progress(max_len);
+        int stop_step_observed = -1;
         for (int step = 0; step < max_len; ++step) {
-            std::cerr << "Decode step " << step << "...\n";
             fill_noise(noise, patch_size, feat_dim, rng);
             VoxCPMDecodeResult result = runtime.decode(std::move(state),
                                                        noise,
@@ -779,10 +973,13 @@ int main(int argc, char** argv) {
                                                        options.cfg_value);
             generated_steps.insert(generated_steps.end(), result.output_0.begin(), result.output_0.end());
             state = std::move(result.output_1);
+            decode_progress.render(step + 1);
 
             if (log_decode_memory && ((step + 1) % log_decode_memory_every == 0 || result.output_2)) {
+                decode_progress.clear_line();
                 const std::string stage = "decode_step_" + std::to_string(step + 1);
                 log_memory_breakdown(true, stage.c_str(), *store, backend, &state);
+                decode_progress.render(step + 1);
             }
 
             if (options.stream) {
@@ -808,9 +1005,27 @@ int main(int argc, char** argv) {
             }
 
             if (step > kMinLen && result.output_2) {
+                const bool first_stop_observation = stop_step_observed < 0;
+                if (first_stop_observation) {
+                    stop_step_observed = step;
+                }
+                if (benchmark_decode_steps > 0 && benchmark_ignore_stop) {
+                    if (first_stop_observation) {
+                        decode_progress.clear_line();
+                        std::cerr << "Stop token observed at step " << step
+                                  << " (continuing due to benchmark mode).\n";
+                        decode_progress.render(step + 1);
+                    }
+                    continue;
+                }
+                decode_progress.clear_line();
                 std::cerr << "Stop token triggered at step " << step << ".\n";
                 break;
             }
+        }
+        decode_progress.finish(static_cast<int>(generated_steps.size() / static_cast<size_t>(patch_size * feat_dim)));
+        if (benchmark_decode_steps > 0 && benchmark_ignore_stop && stop_step_observed >= 0) {
+            std::cerr << "First stop token was observed at step " << stop_step_observed << ".\n";
         }
 
         const int generated_frames = static_cast<int>(generated_steps.size() / static_cast<size_t>(patch_size * feat_dim));

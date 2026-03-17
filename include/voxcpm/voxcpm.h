@@ -28,7 +28,10 @@ struct VoxCPMCachedGraph {
     ggml_tensor* input1 = nullptr;
     ggml_tensor* input2 = nullptr;
     ggml_tensor* input3 = nullptr;
+    ggml_tensor* input4 = nullptr;
     ggml_tensor* output = nullptr;
+    ggml_tensor* output_aux0 = nullptr;
+    std::vector<float> aux_input4;
 
     void clear() {
         context.reset();
@@ -37,7 +40,10 @@ struct VoxCPMCachedGraph {
         input1 = nullptr;
         input2 = nullptr;
         input3 = nullptr;
+        input4 = nullptr;
         output = nullptr;
+        output_aux0 = nullptr;
+        aux_input4.clear();
     }
 };
 
@@ -200,13 +206,16 @@ private:
                                const std::vector<float>& prefix_feat_cond,
                                int inference_timesteps,
                                float cfg_value,
-                               std::vector<float>& output_0);
+                               std::vector<float>& output_0,
+                               std::vector<float>* curr_embed = nullptr);
     std::vector<float> run_locenc_patch_to_lm_embed(const std::vector<float>& patch);
     std::vector<float> run_base_lm_decode_step(const std::vector<float>& curr_embed,
                                                int position,
                                                MiniCPMKVCache& kv_cache);
 
     std::vector<float> encode_feature_sequence(const std::vector<float>& feat, int seq_len);
+    bool should_precompute_cfm_time_table(int n_timesteps) const;
+    const std::vector<float>& get_precomputed_cfm_time_table(int n_timesteps);
 
     VoxCPMConfig config_;
     MiniCPMModel base_lm_;
@@ -226,6 +235,7 @@ private:
     std::unordered_map<int, VoxCPMCachedGraph> fsq_2d_graphs_;
     std::unordered_map<std::string, VoxCPMCachedGraph> unified_cfm_graphs_;
     std::unordered_map<std::string, VoxCPMCachedGraph> decode_front_half_graphs_;
+    std::unordered_map<int, std::vector<float>> precomputed_cfm_time_tables_;
     VoxCPMCachedGraph stop_predictor_graph_;
     VoxCPMCachedGraph locenc_patch_to_lm_embed_graph_;
 };

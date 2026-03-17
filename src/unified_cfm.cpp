@@ -43,20 +43,34 @@ ggml_tensor* UnifiedCFM::optimized_scale(VoxCPMContext& ctx,
 ggml_tensor* UnifiedCFM::compute_velocity_with_cfg(VoxCPMContext& ctx,
                                                    ggml_tensor* x,
                                                    ggml_tensor* mu,
-                                                   ggml_tensor* cond,
+                                                   ggml_tensor* cond_proj,
+                                                   int prefix_len,
+                                                   ggml_tensor* delta_time_zero,
+                                                   ggml_tensor* combined_time_embedding,
                                                    float t,
-                                                   float dt,
                                                    float cfg_value,
                                                    bool use_cfg_zero_star) {
-    VOXCPM_UNUSED(dt);
-
     ggml_context* raw = ctx.raw_context();
+    ggml_tensor* x_proj = estimator_.project_input(ctx, x);
+    if (combined_time_embedding == nullptr) {
+        ggml_tensor* t_scalar = ggml_arange(raw, t, t + 1.0f, 1.0f);
+        combined_time_embedding = estimator_.compute_time_embedding(ctx, t_scalar);
+        if (delta_time_zero != nullptr) {
+            combined_time_embedding = ggml_add(raw, combined_time_embedding, delta_time_zero);
+        }
+    }
 
-    ggml_tensor* t_scalar = ggml_arange(raw, t, t + 1.0f, 1.0f);
-    ggml_tensor* zero_scalar = ggml_arange(raw, 0.0f, 1.0f, 1.0f);
     ggml_tensor* dphi_dt_cond = nullptr;
     ggml_tensor* dphi_dt_uncond = nullptr;
-    estimator_.forward_cfg_pair(ctx, x, mu, t_scalar, cond, zero_scalar, &dphi_dt_cond, &dphi_dt_uncond);
+    estimator_.forward_cfg_pair_projected(
+        ctx,
+        x_proj,
+        mu,
+        combined_time_embedding,
+        cond_proj,
+        prefix_len,
+        &dphi_dt_cond,
+        &dphi_dt_uncond);
 
     if (use_cfg_zero_star) {
         ggml_tensor* st_star = optimized_scale(ctx, dphi_dt_cond, dphi_dt_uncond);
@@ -75,12 +89,15 @@ ggml_tensor* UnifiedCFM::solve_euler(VoxCPMContext& ctx,
                                      ggml_tensor* x,
                                      const std::vector<float>& t_span,
                                      ggml_tensor* mu,
-                                     ggml_tensor* cond,
+                                     ggml_tensor* cond_proj,
+                                     int prefix_len,
+                                     ggml_tensor* delta_time_zero,
+                                     ggml_tensor* precomputed_time_table,
                                      float cfg_value,
                                      bool use_cfg_zero_star) {
     VOXCPM_ASSERT(x != nullptr);
     VOXCPM_ASSERT(mu != nullptr);
-    VOXCPM_ASSERT(cond != nullptr);
+    VOXCPM_ASSERT(cond_proj != nullptr || prefix_len == 0);
     VOXCPM_ASSERT(t_span.size() >= 2);
 
     ggml_context* raw = ctx.raw_context();
@@ -98,7 +115,26 @@ ggml_tensor* UnifiedCFM::solve_euler(VoxCPMContext& ctx,
         if (use_cfg_zero_star && step <= zero_init_steps) {
             dphi_dt = ggml_scale(raw, x, 0.0f);
         } else {
-            dphi_dt = compute_velocity_with_cfg(ctx, x, mu, cond, t, dt, cfg_value, use_cfg_zero_star);
+            ggml_tensor* combined_time_embedding = nullptr;
+            if (precomputed_time_table != nullptr) {
+                const size_t offset = static_cast<size_t>(step - 1) * static_cast<size_t>(estimator_.config().hidden_size) *
+                    sizeof(float);
+                combined_time_embedding = ggml_view_1d(raw,
+                                                       precomputed_time_table,
+                                                       estimator_.config().hidden_size,
+                                                       offset);
+            }
+            dphi_dt = compute_velocity_with_cfg(
+                ctx,
+                x,
+                mu,
+                cond_proj,
+                prefix_len,
+                delta_time_zero,
+                combined_time_embedding,
+                t,
+                cfg_value,
+                use_cfg_zero_star);
         }
 
         x = ggml_sub(raw, x, ggml_scale(raw, dphi_dt, dt));
@@ -121,7 +157,8 @@ ggml_tensor* UnifiedCFM::forward(VoxCPMContext& ctx,
                                  float cfg_value,
                                  float temperature,
                                  float sway_sampling_coef,
-                                 bool use_cfg_zero_star) {
+                                 bool use_cfg_zero_star,
+                                 ggml_tensor* precomputed_time_table) {
     VOXCPM_UNUSED(patch_size);
 
     VOXCPM_ASSERT(z != nullptr);
@@ -133,8 +170,17 @@ ggml_tensor* UnifiedCFM::forward(VoxCPMContext& ctx,
 
     ggml_tensor* x = (temperature == 1.0f) ? z : ggml_scale(ctx.raw_context(), z, temperature);
     const std::vector<float> t_span = compute_t_span(n_timesteps, sway_sampling_coef);
+    const int prefix_len = static_cast<int>(cond->ne[1]);
 
-    return solve_euler(ctx, x, t_span, mu, cond, cfg_value, use_cfg_zero_star);
+    ggml_tensor* cond_proj = prefix_len > 0 ? estimator_.project_condition(ctx, cond) : nullptr;
+    ggml_tensor* delta_time_zero = nullptr;
+    if (precomputed_time_table == nullptr) {
+        ggml_tensor* zero_scalar = ggml_arange(ctx.raw_context(), 0.0f, 1.0f, 1.0f);
+        delta_time_zero = estimator_.compute_delta_time_embedding(ctx, zero_scalar);
+    }
+
+    return solve_euler(
+        ctx, x, t_span, mu, cond_proj, prefix_len, delta_time_zero, precomputed_time_table, cfg_value, use_cfg_zero_star);
 }
 
 }  // namespace voxcpm

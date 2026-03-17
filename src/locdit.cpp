@@ -15,9 +15,27 @@
 
 namespace voxcpm {
 
+namespace {
+
+constexpr float kCfgPairMaskNeg = -1.0e9f;
+
+}
+
 LocDiTModel::~LocDiTModel() {
     scratch_kv_cache_.reset();
 
+    if (cfg_pair_buffer_) {
+        if (backend_) {
+            backend_->free_buffer(cfg_pair_buffer_);
+        } else {
+            ggml_backend_buffer_free(cfg_pair_buffer_);
+        }
+        cfg_pair_buffer_ = nullptr;
+    }
+    if (cfg_pair_ctx_) {
+        ggml_free(cfg_pair_ctx_);
+        cfg_pair_ctx_ = nullptr;
+    }
     if (weight_buffer_) {
         ggml_backend_buffer_free(weight_buffer_);
         weight_buffer_ = nullptr;
@@ -39,6 +57,75 @@ bool LocDiTModel::init_scratch_cache(VoxCPMBackend& backend) {
         config().max_length,
         config().head_dim());
     scratch_kv_cache_->init(backend);
+    return true;
+}
+
+bool LocDiTModel::ensure_cfg_pair_constants(int branch_len) {
+    VOXCPM_ASSERT(branch_len > 0);
+    VOXCPM_ASSERT(backend_ != nullptr);
+
+    if (cfg_pair_branch_len_ == branch_len &&
+        cfg_pair_positions_ != nullptr &&
+        cfg_pair_attention_mask_ != nullptr) {
+        return true;
+    }
+
+    if (cfg_pair_buffer_) {
+        backend_->free_buffer(cfg_pair_buffer_);
+        cfg_pair_buffer_ = nullptr;
+    }
+    if (cfg_pair_ctx_) {
+        ggml_free(cfg_pair_ctx_);
+        cfg_pair_ctx_ = nullptr;
+    }
+    cfg_pair_positions_ = nullptr;
+    cfg_pair_attention_mask_ = nullptr;
+    cfg_pair_branch_len_ = 0;
+
+    ggml_init_params params = {
+        .mem_size = ggml_tensor_overhead() * 2 + 1024,
+        .mem_buffer = nullptr,
+        .no_alloc = true,
+    };
+    cfg_pair_ctx_ = ggml_init(params);
+    if (!cfg_pair_ctx_) {
+        return false;
+    }
+
+    const int total_len = branch_len * 2;
+    cfg_pair_positions_ = ggml_new_tensor_1d(cfg_pair_ctx_, GGML_TYPE_I32, total_len);
+    cfg_pair_attention_mask_ = ggml_new_tensor_2d(cfg_pair_ctx_, GGML_TYPE_F16, total_len, total_len);
+    if (!cfg_pair_positions_ || !cfg_pair_attention_mask_) {
+        return false;
+    }
+
+    cfg_pair_buffer_ = backend_->alloc_buffer(cfg_pair_ctx_, BufferUsage::Weights);
+
+    std::vector<int32_t> positions(static_cast<size_t>(total_len));
+    for (int i = 0; i < total_len; ++i) {
+        positions[static_cast<size_t>(i)] = i % branch_len;
+    }
+    backend_->tensor_set(cfg_pair_positions_,
+                         positions.data(),
+                         0,
+                         positions.size() * sizeof(int32_t));
+
+    std::vector<ggml_fp16_t> mask(static_cast<size_t>(total_len) * static_cast<size_t>(total_len));
+    for (int row = 0; row < total_len; ++row) {
+        const int row_branch = row / branch_len;
+        for (int col = 0; col < total_len; ++col) {
+            const int col_branch = col / branch_len;
+            const float value = row_branch == col_branch ? 0.0f : kCfgPairMaskNeg;
+            mask[static_cast<size_t>(row) * static_cast<size_t>(total_len) + static_cast<size_t>(col)] =
+                ggml_fp32_to_fp16(value);
+        }
+    }
+    backend_->tensor_set(cfg_pair_attention_mask_,
+                         mask.data(),
+                         0,
+                         mask.size() * sizeof(ggml_fp16_t));
+
+    cfg_pair_branch_len_ = branch_len;
     return true;
 }
 
@@ -158,6 +245,96 @@ ggml_tensor* LocDiTModel::compute_delta_time_embedding(VoxCPMContext& ctx, ggml_
                         weights_.delta_time_mlp_linear2_bias);
 }
 
+ggml_tensor* LocDiTModel::project_input(VoxCPMContext& ctx, ggml_tensor* x) const {
+    ggml_context* raw = ctx.raw_context();
+    ggml_tensor* x_proj = ggml_mul_mat(raw, weights_.in_proj_weight, x);
+    return ggml_add(raw, x_proj, weights_.in_proj_bias);
+}
+
+ggml_tensor* LocDiTModel::project_condition(VoxCPMContext& ctx, ggml_tensor* cond) const {
+    ggml_context* raw = ctx.raw_context();
+    ggml_tensor* cond_proj = ggml_mul_mat(raw, weights_.cond_proj_weight, cond);
+    return ggml_add(raw, cond_proj, weights_.cond_proj_bias);
+}
+
+ggml_tensor* LocDiTModel::build_combined_token(VoxCPMContext& ctx,
+                                               ggml_tensor* mu,
+                                               ggml_tensor* t_scalar,
+                                               ggml_tensor* dt_scalar) const {
+    ggml_context* raw = ctx.raw_context();
+    ggml_tensor* combined = compute_time_embedding(ctx, t_scalar);
+    combined = ggml_add(raw, combined, compute_delta_time_embedding(ctx, dt_scalar));
+    if (mu) {
+        combined = ggml_add(raw, mu, combined);
+    }
+    return ggml_reshape_2d(raw, combined, config().hidden_size, 1);
+}
+
+ggml_tensor* LocDiTModel::build_cfg_pair_positions(VoxCPMContext& ctx, int branch_len) const {
+    VOXCPM_ASSERT(branch_len > 0);
+    VOXCPM_ASSERT(branch_len <= config().max_length);
+
+    ggml_context* raw = ctx.raw_context();
+    ggml_tensor* base_positions = ggml_view_1d(raw, decoder_.get_pos_tensor(), branch_len, 0);
+    return ggml_cont(raw, ggml_concat(raw, base_positions, base_positions, 0));
+}
+
+ggml_tensor* LocDiTModel::build_cfg_pair_attention_mask(VoxCPMContext& ctx, int branch_len) const {
+    VOXCPM_ASSERT(branch_len > 0);
+
+    ggml_context* raw = ctx.raw_context();
+    const int total_len = branch_len * 2;
+    const float branch_boundary = 0.5f - static_cast<float>(branch_len);
+
+    ggml_tensor* token_ids = ggml_arange(raw, 0.0f, static_cast<float>(total_len), 1.0f);
+    ggml_tensor* branch_ids = ggml_add1(raw,
+                                        token_ids,
+                                        ggml_arange(raw, branch_boundary, branch_boundary + 1.0f, 1.0f));
+    branch_ids = ggml_step(raw, branch_ids);
+
+    ggml_tensor* key_ids = ggml_reshape_2d(raw, branch_ids, total_len, 1);
+    ggml_tensor* query_ids = ggml_reshape_2d(raw, branch_ids, 1, total_len);
+    ggml_tensor* target = ggml_new_tensor_2d(raw, GGML_TYPE_F32, total_len, total_len);
+
+    ggml_tensor* key_grid = ggml_repeat(raw, key_ids, target);
+    ggml_tensor* query_grid = ggml_repeat(raw, query_ids, target);
+    ggml_tensor* mask = ggml_abs(raw, ggml_sub(raw, key_grid, query_grid));
+    mask = ggml_scale(raw, mask, kCfgPairMaskNeg);
+
+    return ggml_cont(raw, ggml_cast(raw, mask, GGML_TYPE_F16));
+}
+
+ggml_tensor* LocDiTModel::forward_projected(VoxCPMContext& ctx,
+                                            ggml_tensor* x_proj,
+                                            ggml_tensor* combined_token,
+                                            ggml_tensor* cond_proj,
+                                            int prefix_len,
+                                            int seq_len) {
+    VOXCPM_ASSERT(x_proj != nullptr);
+    VOXCPM_ASSERT(combined_token != nullptr);
+    VOXCPM_ASSERT(backend_ != nullptr);
+    VOXCPM_ASSERT(scratch_kv_cache_ != nullptr);
+
+    ggml_context* raw = ctx.raw_context();
+    const int hidden_size = config().hidden_size;
+
+    ggml_tensor* seq = combined_token;
+    if (cond_proj && prefix_len > 0) {
+        seq = ggml_concat(raw, seq, cond_proj, 1);
+    }
+    seq = ggml_concat(raw, seq, x_proj, 1);
+
+    ggml_tensor* hidden = decoder_.forward(ctx, seq, nullptr, *scratch_kv_cache_, false, false);
+    ggml_tensor* hidden_out = ggml_view_2d(raw,
+                                           hidden,
+                                           hidden_size,
+                                           seq_len,
+                                           hidden->nb[1],
+                                           static_cast<size_t>(prefix_len + 1) * hidden->nb[1]);
+    ggml_tensor* output = ggml_mul_mat(raw, weights_.out_proj_weight, hidden_out);
+    return ggml_add(raw, output, weights_.out_proj_bias);
+}
+
 ggml_tensor* LocDiTModel::forward_single(VoxCPMContext& ctx,
                                          ggml_tensor* x,
                                          ggml_tensor* mu,
@@ -171,7 +348,6 @@ ggml_tensor* LocDiTModel::forward_single(VoxCPMContext& ctx,
     VOXCPM_ASSERT(backend_ != nullptr);
     VOXCPM_ASSERT(scratch_kv_cache_ != nullptr);
 
-    ggml_context* raw = ctx.raw_context();
     const int64_t seq_len = x->ne[1];
     const int64_t prefix_len = cond ? cond->ne[1] : 0;
     const int hidden_size = config().hidden_size;
@@ -180,33 +356,113 @@ ggml_tensor* LocDiTModel::forward_single(VoxCPMContext& ctx,
     VOXCPM_ASSERT(mu->ne[0] == hidden_size);
     VOXCPM_ASSERT(prefix_len + seq_len + 1 <= config().max_length);
 
-    scratch_kv_cache_->clear();
+    ggml_tensor* x_proj = project_input(ctx, x);
+    ggml_tensor* cond_proj = (cond && prefix_len > 0) ? project_condition(ctx, cond) : nullptr;
+    ggml_tensor* combined = build_combined_token(ctx, mu, t_scalar, dt_scalar);
+    return forward_projected(ctx, x_proj, combined, cond_proj, static_cast<int>(prefix_len), static_cast<int>(seq_len));
+}
 
-    ggml_tensor* x_proj = ggml_mul_mat(raw, weights_.in_proj_weight, x);
-    x_proj = ggml_add(raw, x_proj, weights_.in_proj_bias);
+std::vector<float> LocDiTModel::precompute_cfg_time_table(const std::vector<float>& t_values) const {
+    VOXCPM_ASSERT(backend_ != nullptr);
 
-    ggml_tensor* combined = ggml_add(raw, mu, compute_time_embedding(ctx, t_scalar));
-    combined = ggml_add(raw, combined, compute_delta_time_embedding(ctx, dt_scalar));
-    combined = ggml_reshape_2d(raw, combined, hidden_size, 1);
-
-    ggml_tensor* seq = combined;
-    if (cond && prefix_len > 0) {
-        ggml_tensor* cond_proj = ggml_mul_mat(raw, weights_.cond_proj_weight, cond);
-        cond_proj = ggml_add(raw, cond_proj, weights_.cond_proj_bias);
-        seq = ggml_concat(raw, seq, cond_proj, 1);
+    if (t_values.empty()) {
+        return {};
     }
-    seq = ggml_concat(raw, seq, x_proj, 1);
 
-    ggml_tensor* hidden = decoder_.forward(ctx, seq, nullptr, *scratch_kv_cache_, false);
-    ggml_tensor* hidden_out = ggml_view_2d(raw,
-                                           hidden,
-                                           hidden_size,
-                                           seq_len,
-                                           hidden->nb[1],
-                                           static_cast<size_t>(prefix_len + 1) * hidden->nb[1]);
-    ggml_tensor* output = ggml_mul_mat(raw, weights_.out_proj_weight, hidden_out);
-    output = ggml_add(raw, output, weights_.out_proj_bias);
-    return output;
+    VoxCPMContext graph_ctx(ContextType::Graph, 8192, 65536);
+    ggml_tensor* t_scalar = graph_ctx.new_tensor_1d(GGML_TYPE_F32, 1);
+    ggml_set_input(t_scalar);
+
+    ggml_tensor* zero_scalar = ggml_arange(graph_ctx.raw_context(), 0.0f, 1.0f, 1.0f);
+    ggml_tensor* combined = compute_time_embedding(graph_ctx, t_scalar);
+    combined = ggml_add(graph_ctx.raw_context(), combined, compute_delta_time_embedding(graph_ctx, zero_scalar));
+    ggml_set_output(combined);
+
+    ggml_cgraph* graph = graph_ctx.new_graph();
+    graph_ctx.build_forward(graph, combined);
+    backend_->reserve_compute_memory(graph, "locdit.cfg_time_table.precompute");
+    backend_->alloc_graph(graph, "locdit.cfg_time_table.precompute");
+
+    const int hidden_size = config().hidden_size;
+    std::vector<float> table(static_cast<size_t>(hidden_size) * t_values.size(), 0.0f);
+    std::vector<float> scratch(static_cast<size_t>(hidden_size), 0.0f);
+
+    for (size_t i = 0; i < t_values.size(); ++i) {
+        const float t_value = t_values[i];
+        backend_->tensor_set(t_scalar, &t_value, 0, sizeof(t_value));
+        VOXCPM_ASSERT(backend_->compute(graph) == GGML_STATUS_SUCCESS);
+        backend_->tensor_get(combined, scratch.data(), 0, scratch.size() * sizeof(float));
+        std::memcpy(table.data() + i * scratch.size(), scratch.data(), scratch.size() * sizeof(float));
+    }
+
+    return table;
+}
+
+void LocDiTModel::forward_cfg_pair_projected(VoxCPMContext& ctx,
+                                             ggml_tensor* x_proj,
+                                             ggml_tensor* mu,
+                                             ggml_tensor* combined_base,
+                                             ggml_tensor* cond_proj,
+                                             int prefix_len,
+                                             ggml_tensor** conditioned,
+                                             ggml_tensor** unconditioned) {
+    VOXCPM_ASSERT(conditioned != nullptr);
+    VOXCPM_ASSERT(unconditioned != nullptr);
+    VOXCPM_ASSERT(x_proj != nullptr);
+    VOXCPM_ASSERT(mu != nullptr);
+    VOXCPM_ASSERT(combined_base != nullptr);
+
+    const int seq_len = static_cast<int>(x_proj->ne[1]);
+    VOXCPM_ASSERT(x_proj->ne[0] == config().hidden_size);
+    VOXCPM_ASSERT(mu->ne[0] == config().hidden_size);
+    VOXCPM_ASSERT(prefix_len + seq_len + 1 <= config().max_length);
+
+    ggml_context* raw = ctx.raw_context();
+    ggml_tensor* combined_cond = ggml_add(raw, ggml_reshape_1d(raw, combined_base, combined_base->ne[0]), mu);
+    combined_cond = ggml_reshape_2d(raw, combined_cond, config().hidden_size, 1);
+    ggml_tensor* combined_base_2d = ggml_reshape_2d(raw, combined_base, config().hidden_size, 1);
+
+    const int branch_len = prefix_len + seq_len + 1;
+    const int total_len = branch_len * 2;
+    if (total_len > config().max_length) {
+        *conditioned = forward_projected(ctx, x_proj, combined_cond, cond_proj, prefix_len, seq_len);
+        *unconditioned = forward_projected(ctx, x_proj, combined_base_2d, cond_proj, prefix_len, seq_len);
+        return;
+    }
+
+    ggml_tensor* conditioned_seq = combined_cond;
+    ggml_tensor* unconditioned_seq = combined_base_2d;
+    if (cond_proj && prefix_len > 0) {
+        conditioned_seq = ggml_concat(raw, conditioned_seq, cond_proj, 1);
+        unconditioned_seq = ggml_concat(raw, unconditioned_seq, cond_proj, 1);
+    }
+    conditioned_seq = ggml_concat(raw, conditioned_seq, x_proj, 1);
+    unconditioned_seq = ggml_concat(raw, unconditioned_seq, x_proj, 1);
+
+    VOXCPM_ASSERT(ensure_cfg_pair_constants(branch_len));
+    ggml_tensor* paired_seq = ggml_concat(raw, conditioned_seq, unconditioned_seq, 1);
+    ggml_tensor* paired_hidden = decoder_.forward(
+        ctx, paired_seq, cfg_pair_positions_, *scratch_kv_cache_, false, false, cfg_pair_attention_mask_);
+
+    ggml_tensor* conditioned_hidden = ggml_view_2d(raw,
+                                                   paired_hidden,
+                                                   config().hidden_size,
+                                                   seq_len,
+                                                   paired_hidden->nb[1],
+                                                   static_cast<size_t>(prefix_len + 1) * paired_hidden->nb[1]);
+    ggml_tensor* unconditioned_hidden = ggml_view_2d(raw,
+                                                     paired_hidden,
+                                                     config().hidden_size,
+                                                     seq_len,
+                                                     paired_hidden->nb[1],
+                                                     static_cast<size_t>(branch_len + prefix_len + 1) * paired_hidden->nb[1]);
+
+    *conditioned = ggml_add(raw,
+                            ggml_mul_mat(raw, weights_.out_proj_weight, conditioned_hidden),
+                            weights_.out_proj_bias);
+    *unconditioned = ggml_add(raw,
+                              ggml_mul_mat(raw, weights_.out_proj_weight, unconditioned_hidden),
+                              weights_.out_proj_bias);
 }
 
 ggml_tensor* LocDiTModel::forward(VoxCPMContext& ctx,
@@ -290,11 +546,25 @@ void LocDiTModel::forward_cfg_pair(VoxCPMContext& ctx,
     VOXCPM_ASSERT(cond != nullptr);
     VOXCPM_ASSERT(dt_scalar != nullptr);
 
-    *conditioned = forward_single(ctx, x, mu, t_scalar, cond, dt_scalar);
+    const int64_t seq_len = x->ne[1];
+    const int64_t prefix_len = cond ? cond->ne[1] : 0;
+    VOXCPM_ASSERT(x->ne[0] == feat_dim_);
+    VOXCPM_ASSERT(mu->ne[0] == config().hidden_size);
+    VOXCPM_ASSERT(prefix_len + seq_len + 1 <= config().max_length);
 
-    ggml_context* raw = ctx.raw_context();
-    ggml_tensor* mu_zero = ggml_scale(raw, mu, 0.0f);
-    *unconditioned = forward_single(ctx, x, mu_zero, t_scalar, cond, dt_scalar);
+    ggml_tensor* x_proj = project_input(ctx, x);
+    ggml_tensor* cond_proj = prefix_len > 0 ? project_condition(ctx, cond) : nullptr;
+    ggml_tensor* delta_time_embedding = compute_delta_time_embedding(ctx, dt_scalar);
+    ggml_tensor* combined_base = compute_time_embedding(ctx, t_scalar);
+    combined_base = ggml_add(ctx.raw_context(), combined_base, delta_time_embedding);
+    forward_cfg_pair_projected(ctx,
+                               x_proj,
+                               mu,
+                               combined_base,
+                               cond_proj,
+                               static_cast<int>(prefix_len),
+                               conditioned,
+                               unconditioned);
 }
 
 }  // namespace voxcpm

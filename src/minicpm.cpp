@@ -109,6 +109,36 @@ static std::vector<float> expand_rope_factors(const std::vector<float>& source, 
     return out;
 }
 
+static bool can_row_fuse(const ggml_tensor* a, const ggml_tensor* b) {
+    return a != nullptr &&
+           b != nullptr &&
+           a->type == b->type &&
+           a->ne[0] == b->ne[0] &&
+           ggml_is_matrix(a) &&
+           ggml_is_matrix(b) &&
+           !ggml_is_transposed(a) &&
+           !ggml_is_transposed(b) &&
+           !ggml_is_view(a) &&
+           !ggml_is_view(b);
+}
+
+static bool copy_rows_into(VoxCPMBackend& backend,
+                           const ggml_tensor* src,
+                           ggml_tensor* dst,
+                           int64_t dst_row_offset,
+                           std::vector<uint8_t>* scratch) {
+    if (!src || !dst || !scratch) {
+        return false;
+    }
+
+    const size_t row_bytes = ggml_row_size(src->type, src->ne[0]);
+    const size_t bytes = row_bytes * static_cast<size_t>(src->ne[1]);
+    scratch->resize(bytes);
+    backend.tensor_get(src, scratch->data(), 0, bytes);
+    backend.tensor_set(dst, scratch->data(), row_bytes * static_cast<size_t>(dst_row_offset), bytes);
+    return true;
+}
+
 }  // namespace
 
 MiniCPMKVCache::MiniCPMKVCache(int n_layer, int n_kv_heads, int max_length, int head_dim)
@@ -248,6 +278,14 @@ MiniCPMModel::MiniCPMModel(const MiniCPMConfig& config)
 }
 
 MiniCPMModel::~MiniCPMModel() {
+    if (fused_weight_buffer_) {
+        ggml_backend_buffer_free(fused_weight_buffer_);
+        fused_weight_buffer_ = nullptr;
+    }
+    if (fused_weight_ctx_) {
+        ggml_free(fused_weight_ctx_);
+        fused_weight_ctx_ = nullptr;
+    }
     if (aux_buffer_) {
         ggml_backend_buffer_free(aux_buffer_);
         aux_buffer_ = nullptr;
@@ -381,6 +419,79 @@ bool MiniCPMModel::init_aux_tensors(VoxCPMBackend& backend) {
     return true;
 }
 
+bool MiniCPMModel::init_fused_projection_tensors(VoxCPMBackend& backend, const std::string& prefix) {
+    if (fused_weight_ctx_ || fused_weight_buffer_) {
+        return true;
+    }
+
+    if (prefix != "locdit." || !backend.is_gpu()) {
+        return true;
+    }
+
+    bool needs_fused = false;
+    for (const MiniCPMLayerWeights& lw : weights_.layers) {
+        needs_fused =
+            needs_fused ||
+            (can_row_fuse(lw.q_proj, lw.k_proj) && can_row_fuse(lw.q_proj, lw.v_proj)) ||
+            can_row_fuse(lw.gate_proj, lw.up_proj);
+    }
+    if (!needs_fused) {
+        return true;
+    }
+
+    ggml_init_params params = {
+        .mem_size = ggml_tensor_overhead() * static_cast<size_t>(config_.n_layer) * 2 + 1024,
+        .mem_buffer = nullptr,
+        .no_alloc = true,
+    };
+    fused_weight_ctx_ = ggml_init(params);
+    if (!fused_weight_ctx_) {
+        return false;
+    }
+
+    for (int i = 0; i < config_.n_layer; ++i) {
+        MiniCPMLayerWeights& lw = weights_.layers[static_cast<size_t>(i)];
+        if (can_row_fuse(lw.q_proj, lw.k_proj) && can_row_fuse(lw.q_proj, lw.v_proj)) {
+            lw.qkv_proj = ggml_new_tensor_2d(fused_weight_ctx_,
+                                             lw.q_proj->type,
+                                             lw.q_proj->ne[0],
+                                             lw.q_proj->ne[1] + lw.k_proj->ne[1] + lw.v_proj->ne[1]);
+        }
+        if (can_row_fuse(lw.gate_proj, lw.up_proj)) {
+            lw.gate_up_proj = ggml_new_tensor_2d(fused_weight_ctx_,
+                                                 lw.gate_proj->type,
+                                                 lw.gate_proj->ne[0],
+                                                 lw.gate_proj->ne[1] + lw.up_proj->ne[1]);
+        }
+    }
+
+    fused_weight_buffer_ = ggml_backend_alloc_ctx_tensors(fused_weight_ctx_, backend.raw_backend());
+    if (!fused_weight_buffer_) {
+        return false;
+    }
+    ggml_backend_buffer_set_usage(fused_weight_buffer_, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+    std::vector<uint8_t> scratch;
+    for (int i = 0; i < config_.n_layer; ++i) {
+        MiniCPMLayerWeights& lw = weights_.layers[static_cast<size_t>(i)];
+        if (lw.qkv_proj) {
+            if (!copy_rows_into(backend, lw.q_proj, lw.qkv_proj, 0, &scratch) ||
+                !copy_rows_into(backend, lw.k_proj, lw.qkv_proj, lw.q_proj->ne[1], &scratch) ||
+                !copy_rows_into(backend, lw.v_proj, lw.qkv_proj, lw.q_proj->ne[1] + lw.k_proj->ne[1], &scratch)) {
+                return false;
+            }
+        }
+        if (lw.gate_up_proj) {
+            if (!copy_rows_into(backend, lw.gate_proj, lw.gate_up_proj, 0, &scratch) ||
+                !copy_rows_into(backend, lw.up_proj, lw.gate_up_proj, lw.gate_proj->ne[1], &scratch)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 bool MiniCPMModel::load_weight_data(FILE* file, gguf_context* gguf_ctx) {
     const int n_tensors = gguf_get_n_tensors(gguf_ctx);
     for (int i = 0; i < n_tensors; ++i) {
@@ -455,7 +566,7 @@ bool MiniCPMModel::load_from_store(const std::shared_ptr<VoxCPMWeightStore>& sto
         ok &= get_required(layer_tensor_name(prefix_norm, i, "ffn_down.weight"), &lw.down_proj);
     }
 
-    return ok && init_aux_tensors(backend);
+    return ok && init_aux_tensors(backend) && init_fused_projection_tensors(backend, prefix_norm);
 }
 
 ggml_tensor* MiniCPMModel::rms_norm(ggml_context* ctx, ggml_tensor* x, ggml_tensor* weight) const {
@@ -506,6 +617,7 @@ ggml_tensor* MiniCPMModel::attention_forward(ggml_context* ctx,
                                              ggml_tensor* hidden,
                                              ggml_tensor* positions,
                                              ggml_tensor* causal_mask,
+                                             ggml_tensor* attention_mask,
                                              const MiniCPMLayerWeights& lw,
                                              MiniCPMKVCache& kv_cache,
                                              int layer_idx,
@@ -515,16 +627,48 @@ ggml_tensor* MiniCPMModel::attention_forward(ggml_context* ctx,
                                              bool write_kv_cache) const {
     const int head_dim = config_.head_dim();
     const int total_len = n_past + n_tokens;
+    const int q_rows = config_.n_heads * head_dim;
+    const int kv_rows = config_.n_kv_heads * head_dim;
 
     VOXCPM_ASSERT(total_len <= kv_cache.max_length());
 
-    ggml_tensor* q = ggml_mul_mat(ctx, lw.q_proj, hidden);
-    ggml_tensor* k = ggml_mul_mat(ctx, lw.k_proj, hidden);
-    ggml_tensor* v = ggml_mul_mat(ctx, lw.v_proj, hidden);
-
-    q = ggml_reshape_3d(ctx, q, head_dim, config_.n_heads, n_tokens);
-    k = ggml_reshape_3d(ctx, k, head_dim, config_.n_kv_heads, n_tokens);
-    v = ggml_reshape_3d(ctx, v, head_dim, config_.n_kv_heads, n_tokens);
+    ggml_tensor* q = nullptr;
+    ggml_tensor* k = nullptr;
+    ggml_tensor* v = nullptr;
+    if (lw.qkv_proj) {
+        ggml_tensor* qkv = ggml_mul_mat(ctx, lw.qkv_proj, hidden);
+        q = ggml_view_3d(ctx,
+                         qkv,
+                         head_dim,
+                         config_.n_heads,
+                         n_tokens,
+                         static_cast<size_t>(head_dim) * qkv->nb[0],
+                         qkv->nb[1],
+                         0);
+        k = ggml_view_3d(ctx,
+                         qkv,
+                         head_dim,
+                         config_.n_kv_heads,
+                         n_tokens,
+                         static_cast<size_t>(head_dim) * qkv->nb[0],
+                         qkv->nb[1],
+                         static_cast<size_t>(q_rows) * qkv->nb[0]);
+        v = ggml_view_3d(ctx,
+                         qkv,
+                         head_dim,
+                         config_.n_kv_heads,
+                         n_tokens,
+                         static_cast<size_t>(head_dim) * qkv->nb[0],
+                         qkv->nb[1],
+                         static_cast<size_t>(q_rows + kv_rows) * qkv->nb[0]);
+    } else {
+        q = ggml_mul_mat(ctx, lw.q_proj, hidden);
+        k = ggml_mul_mat(ctx, lw.k_proj, hidden);
+        v = ggml_mul_mat(ctx, lw.v_proj, hidden);
+        q = ggml_reshape_3d(ctx, q, head_dim, config_.n_heads, n_tokens);
+        k = ggml_reshape_3d(ctx, k, head_dim, config_.n_kv_heads, n_tokens);
+        v = ggml_reshape_3d(ctx, v, head_dim, config_.n_kv_heads, n_tokens);
+    }
 
     q = apply_rope(ctx, q, positions, total_len);
     k = apply_rope(ctx, k, positions, total_len);
@@ -552,7 +696,8 @@ ggml_tensor* MiniCPMModel::attention_forward(ggml_context* ctx,
 
     q = ggml_permute(ctx, q, 0, 2, 1, 3);
 
-    ggml_tensor* mask = is_causal ? causal_mask : nullptr;
+    VOXCPM_ASSERT(!(is_causal && attention_mask != nullptr));
+    ggml_tensor* mask = is_causal ? causal_mask : attention_mask;
 
     ggml_tensor* attn = ggml_flash_attn_ext(ctx, q, k_all, v_all, mask,
                                             1.0f / std::sqrt(static_cast<float>(head_dim)),
@@ -567,9 +712,31 @@ ggml_tensor* MiniCPMModel::attention_forward(ggml_context* ctx,
 ggml_tensor* MiniCPMModel::mlp_forward(ggml_context* ctx,
                                        ggml_tensor* hidden,
                                        const MiniCPMLayerWeights& lw) const {
-    ggml_tensor* gate = ggml_silu(ctx, ggml_mul_mat(ctx, lw.gate_proj, hidden));
-    ggml_tensor* up = ggml_mul_mat(ctx, lw.up_proj, hidden);
-    ggml_tensor* fused = ggml_mul(ctx, gate, up);
+    ggml_tensor* gate = nullptr;
+    ggml_tensor* up = nullptr;
+    bool prefer_fused_glu = false;
+    if (lw.gate_up_proj) {
+        ggml_tensor* gate_up = ggml_mul_mat(ctx, lw.gate_up_proj, hidden);
+        const int64_t inter_rows = lw.gate_proj->ne[1];
+        gate = ggml_view_2d(ctx, gate_up, inter_rows, hidden->ne[1], gate_up->nb[1], 0);
+        up = ggml_view_2d(ctx, gate_up, inter_rows, hidden->ne[1], gate_up->nb[1], static_cast<size_t>(inter_rows) * gate_up->nb[0]);
+        prefer_fused_glu = true;
+    } else {
+        gate = ggml_mul_mat(ctx, lw.gate_proj, hidden);
+        up = ggml_mul_mat(ctx, lw.up_proj, hidden);
+        prefer_fused_glu =
+            lw.gate_proj != nullptr &&
+            lw.gate_proj->buffer != nullptr &&
+            !ggml_backend_buffer_is_host(lw.gate_proj->buffer);
+    }
+
+    ggml_tensor* fused = nullptr;
+    if (prefer_fused_glu) {
+        fused = ggml_swiglu_split(ctx, gate, up);
+    } else {
+        gate = ggml_silu(ctx, gate);
+        fused = ggml_mul(ctx, gate, up);
+    }
     return ggml_mul_mat(ctx, lw.down_proj, fused);
 }
 
@@ -577,6 +744,7 @@ ggml_tensor* MiniCPMModel::layer_forward(ggml_context* ctx,
                                          ggml_tensor* hidden,
                                          ggml_tensor* positions,
                                          ggml_tensor* causal_mask,
+                                         ggml_tensor* attention_mask,
                                          const MiniCPMLayerWeights& lw,
                                          MiniCPMKVCache& kv_cache,
                                          int layer_idx,
@@ -586,7 +754,7 @@ ggml_tensor* MiniCPMModel::layer_forward(ggml_context* ctx,
                                          bool write_kv_cache) const {
     ggml_tensor* residual = hidden;
     ggml_tensor* normed = rms_norm(ctx, hidden, lw.input_layernorm);
-    ggml_tensor* attn_out = attention_forward(ctx, normed, positions, causal_mask, lw, kv_cache,
+    ggml_tensor* attn_out = attention_forward(ctx, normed, positions, causal_mask, attention_mask, lw, kv_cache,
                                               layer_idx, n_tokens, n_past, is_causal, write_kv_cache);
     if (config_.use_mup) {
         attn_out = ggml_scale(ctx, attn_out, residual_scale_);
@@ -607,8 +775,10 @@ ggml_tensor* MiniCPMModel::forward(VoxCPMContext& ctx,
                                    ggml_tensor* positions,
                                    MiniCPMKVCache& kv_cache,
                                    bool is_causal,
-                                   bool write_kv_cache) {
+                                   bool write_kv_cache,
+                                   ggml_tensor* attention_mask) {
     VOXCPM_ASSERT(input != nullptr);
+    VOXCPM_ASSERT(is_causal || attention_mask == nullptr || ggml_is_contiguous(attention_mask));
 
     ggml_context* raw = ctx.raw_context();
     const int n_tokens = input->ne[1] > 0 ? static_cast<int>(input->ne[1]) : 1;
@@ -620,7 +790,7 @@ ggml_tensor* MiniCPMModel::forward(VoxCPMContext& ctx,
     ggml_tensor* hidden = input;
     ggml_tensor* causal_mask = is_causal ? create_causal_mask(raw, positions, n_tokens) : nullptr;
     for (int i = 0; i < config_.n_layer; ++i) {
-        hidden = layer_forward(raw, hidden, positions, causal_mask, weights_.layers[i], kv_cache, i, n_tokens, 0, is_causal, write_kv_cache);
+        hidden = layer_forward(raw, hidden, positions, causal_mask, attention_mask, weights_.layers[i], kv_cache, i, n_tokens, 0, is_causal, write_kv_cache);
     }
     return rms_norm(raw, hidden, weights_.norm);
 }
@@ -659,7 +829,7 @@ ggml_tensor* MiniCPMModel::forward_step(VoxCPMContext& ctx,
     // Single-token decode never attends to future positions, so the mask is redundant.
     ggml_tensor* causal_mask = nullptr;
     for (int i = 0; i < config_.n_layer; ++i) {
-        hidden = layer_forward(raw, hidden, positions, causal_mask, weights_.layers[i], kv_cache, i, 1, position, is_causal, write_kv_cache);
+        hidden = layer_forward(raw, hidden, positions, causal_mask, nullptr, weights_.layers[i], kv_cache, i, 1, position, is_causal, write_kv_cache);
     }
 
     hidden = rms_norm(raw, hidden, weights_.norm);

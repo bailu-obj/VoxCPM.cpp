@@ -475,7 +475,7 @@ std::vector<float> extract_prompt_features(AudioVAE& audio_vae,
                                            int patch_size,
                                            int feat_dim) {
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
-    ggml_tensor* latent = audio_vae.encode(graph_ctx, audio, sample_rate);
+    ggml_tensor* latent = audio_vae.encode(graph_ctx, backend, audio, sample_rate);
     if (!latent) {
         fail("Failed to build AudioVAE encode graph");
     }
@@ -523,7 +523,7 @@ std::vector<float> decode_audio(AudioVAE& audio_vae,
     VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
     ggml_tensor* latent = graph_ctx.new_tensor_2d(GGML_TYPE_F32, total_patches, feat_dim);
     ggml_set_input(latent);
-    ggml_tensor* audio = audio_vae.decode(graph_ctx, latent);
+    ggml_tensor* audio = audio_vae.decode(graph_ctx, backend, latent);
     if (!audio) {
         fail("Failed to build AudioVAE decode graph");
     }
@@ -1119,7 +1119,7 @@ void append_l1_records(std::vector<BenchmarkRecord>& records,
                                                    [&]() {
         std::vector<float> audio = scenario.spec.mono_audio;
         VoxCPMContext graph_ctx(ContextType::Graph, 32768, 262144);
-        ggml_tensor* latent = bundle.audio_vae.encode(graph_ctx, audio, bundle.audio_vae.config().sample_rate);
+        ggml_tensor* latent = bundle.audio_vae.encode(graph_ctx, bundle.backend, audio, bundle.audio_vae.config().sample_rate);
         ggml_cgraph* graph = graph_ctx.new_graph();
         graph_ctx.build_forward(graph, latent);
         bundle.backend.reserve_compute_memory(graph, "benchmark.audio_vae.encode");
