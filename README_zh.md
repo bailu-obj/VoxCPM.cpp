@@ -17,6 +17,29 @@
 - `third_party/json`、`third_party/llama.cpp`、`third_party/whisper.cpp` 和 `third_party/SenseVoice.cpp` 仅作为本地参考，被仓库忽略。
 - `CMakeLists.txt` 已支持在 `third_party/json` 缺失时通过 `FetchContent` 下载 `nlohmann_json`。
 
+## 重构预告
+
+仓库接下来会推进一轮更完整的 Torch-to-GGML runtime 重构，设计方向见以下两份文档：
+
+- [docs/voxcpm_torch_to_ggml_complete_refactor_cookbook_zh.md](docs/voxcpm_torch_to_ggml_complete_refactor_cookbook_zh.md)
+- [docs/torch_to_ggml_migration_guide_zh.md](docs/torch_to_ggml_migration_guide_zh.md)
+
+这次重构的原因主要有几点：
+
+- 当前代码已经可以运行，但整体实现仍然带有较强的“把 PyTorch 模块直接拆成若干 C++ 片段”的迁移痕迹。
+- 这种写法适合快速跑通模型，但会让 shape 契约、对象所有权、持久状态、graph 生命周期以及 backend 放置策略逐渐缠在一起，后续维护和排错成本越来越高。
+- 热路径里如果频繁出现 `tensor_get -> std::vector -> tensor_set` 这类 host/backend 往返，随着模型变复杂、后端变多，性能和结构问题都会被进一步放大。
+
+这轮重构不是表层整理，而是准备把 `VoxCPM.cpp` 推向更成熟的 `ggml` runtime 形态，包括：
+
+- 先固定 GGUF 契约和模块级输入输出契约
+- 用共享 `WeightStore` 和 backend-aware 的 loader/runtime 骨架统一权重与执行路径
+- 明确拆分权重、持久 state、compute 内存和 output buffer
+- 用真实重建条件驱动 graph cache，而不是只靠 shape 猜测
+- 让模块热路径尽量直接传递 backend-resident tensor 或 state handle，减少无意义的数据回传
+
+一句话说，这次重构的目标不是继续堆补丁，而是把项目从“host 侧模块翻译式实现”推进到“契约先行、后端感知、可验证可扩展”的 runtime 架构。
+
 ## 构建
 
 ### CPU 构建

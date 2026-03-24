@@ -17,6 +17,29 @@ This directory now serves as the standalone repository root for `VoxCPM.cpp`.
 - `third_party/json`, `third_party/llama.cpp`, `third_party/whisper.cpp`, and `third_party/SenseVoice.cpp` are kept only as local references and are ignored by this repository.
 - `CMakeLists.txt` already supports downloading `nlohmann_json` with `FetchContent` when `third_party/json` is absent.
 
+## Refactor Preview
+
+A larger Torch-to-GGML runtime refactor is planned. The design direction is documented in:
+
+- [docs/voxcpm_torch_to_ggml_complete_refactor_cookbook_zh.md](docs/voxcpm_torch_to_ggml_complete_refactor_cookbook_zh.md)
+- [docs/torch_to_ggml_migration_guide_zh.md](docs/torch_to_ggml_migration_guide_zh.md)
+
+Why this refactor is needed:
+
+- The current codebase already runs, but much of the implementation still reflects a direct "translate PyTorch modules into C++ pieces" path.
+- That approach is good for bringing a model up quickly, but it makes shape contracts, ownership boundaries, persistent state, graph lifetime, and backend placement harder to reason about.
+- It also tends to introduce avoidable host/backend round-trips such as `tensor_get -> std::vector -> tensor_set`, which become increasingly costly once the model grows or multi-backend execution is involved.
+
+The refactor target is not a cosmetic rewrite. The goal is to move `VoxCPM.cpp` toward a more mature `ggml` runtime with:
+
+- explicit GGUF and module-level contracts
+- a shared `WeightStore` and backend-aware loader/runtime skeleton
+- clear separation of weights, persistent state, compute memory, and output buffers
+- graph caching keyed by real rebuild conditions instead of ad hoc shape guesses
+- backend-resident hot-path data flow between modules whenever possible
+
+In short, the project is moving away from a host-side module translation style and toward a contract-first, backend-aware runtime architecture that is easier to verify, optimize, and extend across CPU/CUDA/Vulkan paths.
+
 ## Build
 
 ### CPU Build
