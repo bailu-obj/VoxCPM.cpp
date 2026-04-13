@@ -213,7 +213,7 @@ JSON 请求字段：
 - `voice`：必填
   - 可以直接传字符串 voice id，例如 `"taiyi"`
   - 也可以传对象形式 `{ "id": "taiyi" }`
-- `response_format`：可选，支持 `mp3`、`flac`、`wav`、`pcm`
+- `response_format`：可选，目前仅支持 `wav`
 - `speed`：可选浮点数，范围 `0.25` 到 `4.0`
 - `stream_format`：可选，支持 `audio` 或 `sse`
 - `instructions`：为兼容接口而保留，但只要传非空值目前就会报错
@@ -235,12 +235,10 @@ JSON 请求字段：
 - 额外请求进入等待队列，长度由 `--max-queue` 控制
 - 队列满时返回 `503`
 
-当前 `response_format` 仅支持：
+当前 `response_format` 仅支持 `wav`。
+`mp3`、`flac`、`pcm` 等其他格式暂不支持，因为尚未选定合适的轻量级编码方案。
 
-- `mp3`
-- `flac`
 - `wav`
-- `pcm`
 
 ### 构建
 

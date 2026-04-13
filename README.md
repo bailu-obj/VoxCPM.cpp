@@ -213,7 +213,7 @@ JSON request fields:
 - `voice`: required
   - string voice id, for example `"taiyi"`
   - or object form `{ "id": "taiyi" }`
-- `response_format`: optional, one of `mp3`, `flac`, `wav`, `pcm`
+- `response_format`: optional, currently only `wav` is supported
 - `speed`: optional float, range `0.25` to `4.0`
 - `stream_format`: optional, `audio` or `sse`
 - `instructions`: accepted for compatibility, but non-empty values currently return an error
@@ -235,12 +235,10 @@ Queue behavior:
 - additional requests wait in a bounded queue controlled by `--max-queue`
 - when the queue is full, the server returns `503`
 
-The server currently supports `response_format` values:
+The server currently supports only `wav` for `response_format`.
+Other formats such as `mp3`, `flac`, and `pcm` are not supported yet because a suitable lightweight encoding path has not been selected.
 
-- `mp3`
-- `flac`
 - `wav`
-- `pcm`
 
 ### Build
 
