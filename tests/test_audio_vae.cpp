@@ -169,6 +169,15 @@ TEST_CASE("AudioVAEConfig output sample rate falls back to input sample rate", "
     REQUIRE(config.output_sample_rate() == 48000);
 }
 
+TEST_CASE("AudioVAEConfig keeps encoder and decoder hop lengths separate", "[audio_vae][config]") {
+    AudioVAEConfig config;
+    config.encoder_rates = {2, 5, 8, 8};
+    config.decoder_rates = {8, 6, 5, 2, 2, 2};
+
+    REQUIRE(config.hop_length() == 640);
+    REQUIRE(config.decode_hop_length() == 1920);
+}
+
 void print_error_stats(const char* label,
                        const std::vector<float>& input,
                        const std::vector<float>& expected,

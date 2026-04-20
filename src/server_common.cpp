@@ -28,6 +28,19 @@ using json = nlohmann::json;
     throw std::runtime_error(message);
 }
 
+int env_int_or_default(const char* name, int default_value) {
+    const char* raw = std::getenv(name);
+    if (!raw || raw[0] == '\0') {
+        return default_value;
+    }
+
+    try {
+        return std::max(1, std::stoi(raw));
+    } catch (const std::exception&) {
+        return default_value;
+    }
+}
+
 std::filesystem::path manifest_path_for(const std::string& root, const std::string& id) {
     return std::filesystem::path(root) / id / "manifest.json";
 }
@@ -359,6 +372,49 @@ int chunked_audio_decode_patch_threshold(const AudioVAE& audio_vae) {
     return kDefaultCudaAudioDecodePatchThreshold;
 }
 
+int chunked_audio_decode_max_window_patches(const AudioVAE& audio_vae) {
+    constexpr int kDefaultMaxWindowPatches = 1536;
+    constexpr int kConditionedMaxWindowPatches = 1024;
+    const bool has_sr_conditioning = std::any_of(audio_vae.weights().decoder_blocks.begin(),
+                                                 audio_vae.weights().decoder_blocks.end(),
+                                                 [](const DecoderBlockWeights& block) {
+                                                     return block.sr_cond.active();
+                                                 });
+    if (has_sr_conditioning || audio_vae.config().num_decoder_blocks() >= 6) {
+        return kConditionedMaxWindowPatches;
+    }
+    return kDefaultMaxWindowPatches;
+}
+
+int chunked_audio_decode_history_frames(const AudioVAE& audio_vae, int patch_size) {
+    constexpr int kDefaultChunkHistoryFrames = 64;
+    constexpr int kConditionedChunkHistoryFrames = 192;
+    const bool has_sr_conditioning = std::any_of(audio_vae.weights().decoder_blocks.begin(),
+                                                 audio_vae.weights().decoder_blocks.end(),
+                                                 [](const DecoderBlockWeights& block) {
+                                                     return block.sr_cond.active();
+                                                 });
+    int history_frames = has_sr_conditioning || audio_vae.config().num_decoder_blocks() >= 6
+                             ? kConditionedChunkHistoryFrames
+                             : kDefaultChunkHistoryFrames;
+    const int env_override = env_int_or_default("VOXCPM_AUDIO_DECODE_HISTORY_FRAMES", 0);
+    if (env_override > 0) {
+        history_frames = env_override;
+    }
+    const int max_window_frames =
+        std::max(1, chunked_audio_decode_max_window_patches(audio_vae) / std::max(1, patch_size));
+    return std::min(history_frames, std::max(0, max_window_frames - 1));
+}
+
+int chunked_audio_decode_chunk_frames(const AudioVAE& audio_vae,
+                                      int patch_size,
+                                      int history_frames) {
+    const int requested_chunk_frames = env_int_or_default("VOXCPM_AUDIO_DECODE_CHUNK_FRAMES", 64);
+    const int max_window_frames =
+        std::max(1, chunked_audio_decode_max_window_patches(audio_vae) / std::max(1, patch_size));
+    return std::min(requested_chunk_frames, std::max(1, max_window_frames - history_frames));
+}
+
 bool should_use_chunked_audio_decode(const VoxCPMBackend& backend,
                                      const AudioVAE& audio_vae,
                                      int total_patches) {
@@ -369,11 +425,11 @@ std::vector<float> decode_audio_chunked_from_patch_major_frames(AudioVAE& audio_
                                                                 VoxCPMBackend& backend,
                                                                 const std::vector<float>& frames,
                                                                 int skip_frames,
-                                                                int context_frames,
+                                                                int history_frames,
+                                                                int chunk_frames,
                                                                 int patch_size,
                                                                 int feat_dim,
                                                                 int patch_len) {
-    constexpr int kAudioDecodeChunkFrames = 64;
     const size_t frame_stride = static_cast<size_t>(patch_size) * feat_dim;
     const int total_frames = static_cast<int>(frames.size() / frame_stride);
     if (frames.empty() || (frames.size() % frame_stride) != 0 || skip_frames < 0 || skip_frames > total_frames) {
@@ -382,21 +438,25 @@ std::vector<float> decode_audio_chunked_from_patch_major_frames(AudioVAE& audio_
 
     std::vector<float> waveform;
     waveform.reserve(static_cast<size_t>(std::max(0, total_frames - skip_frames)) * static_cast<size_t>(patch_len));
-    for (int chunk_start = skip_frames; chunk_start < total_frames; chunk_start += kAudioDecodeChunkFrames) {
-        const int new_frames = std::min(kAudioDecodeChunkFrames, total_frames - chunk_start);
-        const int actual_context = std::min(context_frames, chunk_start);
-        const int window_start = chunk_start - actual_context;
-        const int window_frames = actual_context + new_frames;
+    for (int chunk_start = skip_frames; chunk_start < total_frames; chunk_start += chunk_frames) {
+        const int new_frames = std::min(chunk_frames, total_frames - chunk_start);
+        const int actual_history = std::min(history_frames, chunk_start);
+        const int window_start = chunk_start - actual_history;
+        const int window_frames = actual_history + new_frames;
         const size_t begin = static_cast<size_t>(window_start) * frame_stride;
         const size_t end = static_cast<size_t>(window_start + window_frames) * frame_stride;
         std::vector<float> window_frames_host(frames.begin() + static_cast<std::ptrdiff_t>(begin),
                                               frames.begin() + static_cast<std::ptrdiff_t>(end));
         std::vector<float> chunk_waveform =
             decode_audio_from_patch_major_frames(audio_vae, backend, window_frames_host, patch_size, feat_dim);
+        const size_t discard = static_cast<size_t>(actual_history) * static_cast<size_t>(patch_len);
+        if (chunk_waveform.size() > discard) {
+            chunk_waveform.erase(chunk_waveform.begin(),
+                                 chunk_waveform.begin() + static_cast<std::ptrdiff_t>(discard));
+        }
         const size_t keep = static_cast<size_t>(new_frames) * static_cast<size_t>(patch_len);
         if (chunk_waveform.size() > keep) {
-            chunk_waveform.erase(chunk_waveform.begin(),
-                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(keep));
+            chunk_waveform.resize(keep);
         }
         waveform.insert(waveform.end(), chunk_waveform.begin(), chunk_waveform.end());
     }
@@ -409,28 +469,32 @@ std::vector<float> decode_audio_chunked_from_output_pool(AudioVAE& audio_vae,
                                                          int frame_offset,
                                                          int frame_count,
                                                          int skip_frames,
-                                                         int context_frames,
+                                                         int history_frames,
+                                                         int chunk_frames,
                                                          int patch_size,
                                                          int feat_dim,
                                                          int patch_len) {
-    constexpr int kAudioDecodeChunkFrames = 64;
     if (frame_count <= 0 || skip_frames < 0 || skip_frames > frame_count) {
         return {};
     }
 
     std::vector<float> waveform;
     waveform.reserve(static_cast<size_t>(std::max(0, frame_count - skip_frames)) * static_cast<size_t>(patch_len));
-    for (int chunk_start = skip_frames; chunk_start < frame_count; chunk_start += kAudioDecodeChunkFrames) {
-        const int new_frames = std::min(kAudioDecodeChunkFrames, frame_count - chunk_start);
-        const int actual_context = std::min(context_frames, chunk_start);
-        const int window_offset = frame_offset + chunk_start - actual_context;
-        const int window_frames = actual_context + new_frames;
+    for (int chunk_start = skip_frames; chunk_start < frame_count; chunk_start += chunk_frames) {
+        const int new_frames = std::min(chunk_frames, frame_count - chunk_start);
+        const int actual_history = std::min(history_frames, chunk_start);
+        const int window_offset = frame_offset + chunk_start - actual_history;
+        const int window_frames = actual_history + new_frames;
         std::vector<float> chunk_waveform =
             decode_audio_from_output_pool(audio_vae, backend, output_pool, window_offset, window_frames, patch_size, feat_dim);
+        const size_t discard = static_cast<size_t>(actual_history) * static_cast<size_t>(patch_len);
+        if (chunk_waveform.size() > discard) {
+            chunk_waveform.erase(chunk_waveform.begin(),
+                                 chunk_waveform.begin() + static_cast<std::ptrdiff_t>(discard));
+        }
         const size_t keep = static_cast<size_t>(new_frames) * static_cast<size_t>(patch_len);
         if (chunk_waveform.size() > keep) {
-            chunk_waveform.erase(chunk_waveform.begin(),
-                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(keep));
+            chunk_waveform.resize(keep);
         }
         waveform.insert(waveform.end(), chunk_waveform.begin(), chunk_waveform.end());
     }
@@ -723,10 +787,10 @@ PromptFeatures VoxCPMServiceCore::encode_prompt_audio_locked(const std::string& 
                                                              int sample_rate) {
     const int patch_size_value = runtime_.config().patch_size;
     const int feat_dim_value = runtime_.config().feat_dim;
-    const int patch_len = patch_size_value * audio_vae_.config().hop_length();
+    const int encode_patch_len = patch_size_value * audio_vae_.config().hop_length();
     std::vector<float> resampled = resample_audio_to_rate(mono_audio, sample_rate, audio_vae_.config().sample_rate);
     resampled = trim_audio_silence_vad(resampled, audio_vae_.config().sample_rate);
-    pad_audio_for_patch_alignment(resampled, static_cast<size_t>(patch_len), PaddingMode::Left);
+    pad_audio_for_patch_alignment(resampled, static_cast<size_t>(encode_patch_len), PaddingMode::Left);
 
     PromptFeatures features;
     features.id = id;
@@ -759,10 +823,10 @@ PromptFeatures VoxCPMServiceCore::encode_reference_audio_locked(const std::strin
                                                                 int sample_rate) {
     const int patch_size_value = runtime_.config().patch_size;
     const int feat_dim_value = runtime_.config().feat_dim;
-    const int patch_len = patch_size_value * audio_vae_.config().hop_length();
+    const int encode_patch_len = patch_size_value * audio_vae_.config().hop_length();
     std::vector<float> resampled = resample_audio_to_rate(mono_audio, sample_rate, audio_vae_.config().sample_rate);
     resampled = trim_audio_silence_vad(resampled, audio_vae_.config().sample_rate);
-    pad_audio_for_patch_alignment(resampled, static_cast<size_t>(patch_len), PaddingMode::Right);
+    pad_audio_for_patch_alignment(resampled, static_cast<size_t>(encode_patch_len), PaddingMode::Right);
 
     PromptFeatures features;
     features.id = id;
@@ -803,7 +867,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
     }
     const int patch_size_value = runtime_.config().patch_size;
     const int feat_dim_value = runtime_.config().feat_dim;
-    const int patch_len = patch_size_value * audio_vae_.config().hop_length();
+    const int decode_patch_len = patch_size_value * audio_vae_.config().decode_hop_length();
     const size_t expected_prompt_feat_size =
         static_cast<size_t>(request.prompt.prompt_audio_length) *
         static_cast<size_t>(patch_size_value) *
@@ -945,9 +1009,9 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                                           recent_frame_count,
                                                           patch_size_value,
                                                           feat_dim_value);
-                        if (chunk_waveform.size() > static_cast<size_t>(patch_len)) {
+                        if (chunk_waveform.size() > static_cast<size_t>(decode_patch_len)) {
                             chunk_waveform.erase(chunk_waveform.begin(),
-                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(patch_len));
+                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(decode_patch_len));
                         }
                         clear_decode_graph_caches_after_streaming_audio_decode(runtime_, state);
                         request.chunk_callback(chunk_waveform);
@@ -965,9 +1029,9 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                                                                                  stream_recent_frames,
                                                                                                  patch_size_value,
                                                                                                  feat_dim_value);
-                        if (chunk_waveform.size() > static_cast<size_t>(patch_len)) {
+                        if (chunk_waveform.size() > static_cast<size_t>(decode_patch_len)) {
                             chunk_waveform.erase(chunk_waveform.begin(),
-                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(patch_len));
+                                                 chunk_waveform.end() - static_cast<std::ptrdiff_t>(decode_patch_len));
                         }
                         clear_decode_graph_caches_after_streaming_audio_decode(runtime_, state);
                         request.chunk_callback(chunk_waveform);
@@ -1011,6 +1075,9 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
         std::vector<float> waveform;
         std::vector<float> latent;
         const bool use_chunked_final_audio_decode = should_use_chunked_audio_decode(*backend_, audio_vae_, total_patches);
+        const int decode_history_frames = chunked_audio_decode_history_frames(audio_vae_, patch_size_value);
+        const int decode_chunk_frames =
+            chunked_audio_decode_chunk_frames(audio_vae_, patch_size_value, decode_history_frames);
         if (use_output_pool_timeline &&
             state.audio_frame_count >= prompt_audio_length + generated_frames) {
             const int frame_offset =
@@ -1025,10 +1092,11 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                                                  frame_offset,
                                                                  total_frames,
                                                                  prepended_context_frames,
-                                                                 prepended_context_frames,
+                                                                 decode_history_frames,
+                                                                 decode_chunk_frames,
                                                                  patch_size_value,
                                                                  feat_dim_value,
-                                                                 patch_len);
+                                                                 decode_patch_len);
                 prepended_context_frames = 0;
             } else {
                 waveform = decode_audio_from_output_pool(audio_vae_,
@@ -1052,10 +1120,11 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
                                                                         *backend_,
                                                                         decode_frames,
                                                                         prepended_context_frames,
-                                                                        prepended_context_frames,
+                                                                        decode_history_frames,
+                                                                        decode_chunk_frames,
                                                                         patch_size_value,
                                                                         feat_dim_value,
-                                                                        patch_len);
+                                                                        decode_patch_len);
                 prepended_context_frames = 0;
             } else {
                 latent = build_decode_latent_sequence(request.prompt.prompt_feat,
@@ -1069,7 +1138,7 @@ SynthesisResult VoxCPMServiceCore::synthesize_locked(const SynthesisRequest& req
             }
         }
         if (has_prompt_audio) {
-            const size_t trim = static_cast<size_t>(patch_len) * static_cast<size_t>(prepended_context_frames);
+            const size_t trim = static_cast<size_t>(decode_patch_len) * static_cast<size_t>(prepended_context_frames);
             if (waveform.size() > trim) {
                 waveform.erase(waveform.begin(), waveform.begin() + static_cast<std::ptrdiff_t>(trim));
             }
